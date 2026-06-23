@@ -6,7 +6,7 @@ import re
 import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -16,7 +16,6 @@ import torch
 from scipy.sparse import issparse
 from sklearn.metrics import auc as sk_auc
 from sklearn.metrics import precision_recall_curve, roc_auc_score
-from sklearn.metrics.pairwise import cosine_similarity
 from torch_geometric.data import Data
 from torch_geometric.utils import remove_isolated_nodes
 
@@ -24,31 +23,12 @@ MAT_ADJ_KEYS = ("Network", "network", "A", "adj", "Adj", "adjacency", "edges")
 MAT_FEAT_KEYS = ("Attributes", "attributes", "X", "x", "features", "Features", "attrb", "attr")
 MAT_LABEL_KEYS = ("Label", "label", "labels", "y", "Y", "gnd", "Class", "class")
 
-# In-process caches reduce repeated disk IO during grid search / repeated train_ours calls.
 _DATA_CACHE: Dict[Tuple[str, str, float], Data] = {}
-_PREPROCESS_CACHE: Dict[Tuple[str, str, str, int, int, float, float], Tuple[List[int], np.ndarray, Path, Path]] = {}
+_PREPROCESS_CACHE: Dict[Tuple, Tuple[List[int], Path]] = {}
 
 
 def _expand_path(path_like) -> Path:
     return Path(os.path.expanduser(str(path_like))).resolve()
-
-
-def resolve_preprocess_paths(args) -> Tuple[Path, Path, Path]:
-    """Resolve preprocess cache location.
-
-    If --cache_dir is not explicitly set, generated files are placed under
-    <train_dir>/cgad_preprocess instead of the dataset directory:
-        <train_dir>/cgad_preprocess/<dataset>.json
-        <train_dir>/cgad_preprocess/<dataset>.pkl
-    """
-    if getattr(args, "cache_dir", None):
-        cache_dir = _expand_path(args.cache_dir)
-    else:
-        train_dir = _expand_path(getattr(args, "train_dir", "./runs"))
-        cache_dir = train_dir / "cgad_preprocess"
-    community_path = cache_dir / f"{args.dataset}.json"
-    coef_path = cache_dir / f"{args.dataset}.pkl"
-    return cache_dir, community_path, coef_path
 
 
 def _atomic_json_dump(obj, path: Path):
@@ -87,7 +67,13 @@ def _as_csr_matrix(value) -> sp.csr_matrix:
     value = _to_numpy_or_sparse(value)
     if issparse(value):
         return value.tocsr()
-    return sp.csr_matrix(np.asarray(value))
+    arr = np.asarray(value)
+    # Accept two-column edge list as well as dense adjacency.
+    if arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] != arr.shape[1]:
+        n = int(arr.max()) + 1
+        row, col = arr[:, 0].astype(np.int64), arr[:, 1].astype(np.int64)
+        return sp.csr_matrix((np.ones_like(row, dtype=np.float32), (row, col)), shape=(n, n))
+    return sp.csr_matrix(arr)
 
 
 def _as_dense_float_array(value) -> np.ndarray:
@@ -106,7 +92,6 @@ def _as_label_array(value, num_nodes: int) -> np.ndarray:
         value = value.toarray()
     value = np.asarray(value).squeeze()
     if value.ndim > 1:
-        # For one-hot labels, use the positive/anomaly column if possible.
         if value.shape[0] == num_nodes:
             value = np.argmax(value, axis=1)
         else:
@@ -114,7 +99,6 @@ def _as_label_array(value, num_nodes: int) -> np.ndarray:
     value = value.astype(np.int64)
     if value.shape[0] != num_nodes:
         raise ValueError(f"Label length {value.shape[0]} does not match num_nodes {num_nodes}.")
-    # Some binary anomaly datasets use {-1, 1}; make them {0, 1}.
     uniq = set(np.unique(value).tolist())
     if uniq.issubset({-1, 1}):
         value = (value > 0).astype(np.int64)
@@ -122,18 +106,11 @@ def _as_label_array(value, num_nodes: int) -> np.ndarray:
 
 
 def load_mat_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
-    """Load common GAD .mat datasets as a PyG Data object.
-
-    Supported key aliases:
-    - adjacency: Network/A/adj/adjacency
-    - feature: Attributes/X/features/attrb
-    - label: Label/y/gnd/Class
-    """
+    """Load common graph anomaly .mat datasets as a PyG Data object."""
     data_dir = _expand_path(data_dir)
     mat_path = data_dir / f"{dataset}.mat"
     if not mat_path.exists():
         raise FileNotFoundError(f"Cannot find dataset file: {mat_path}")
-
     mtime = mat_path.stat().st_mtime
     cache_key = (dataset, str(data_dir), mtime)
     if cache_key in _DATA_CACHE:
@@ -154,11 +131,9 @@ def load_mat_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
     adj = adj.maximum(adj.T)
     adj.setdiag(0)
     adj.eliminate_zeros()
-
     x = _as_dense_float_array(mat[feat_key])
     y = _as_label_array(mat[label_key], adj.shape[0])
     if x.shape[0] != adj.shape[0]:
-        # Some .mat files store attributes transposed.
         if x.shape[1] == adj.shape[0]:
             x = x.T
         else:
@@ -176,17 +151,43 @@ def load_mat_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
     return data
 
 
+def load_graph_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
+    """Load .mat first; fall back to the original .pt format for compatibility."""
+    data_dir_path = _expand_path(data_dir)
+    mat_path = data_dir_path / f"{dataset}.mat"
+    if mat_path.exists():
+        return load_mat_data(dataset, str(data_dir_path))
+
+    candidates = [Path(f"{dataset}.pt"), data_dir_path / f"{dataset}.pt"]
+    for pt_path in candidates:
+        if pt_path.exists():
+            data = torch.load(pt_path, map_location="cpu")
+            if not hasattr(data, "num_nodes") or data.num_nodes is None:
+                data.num_nodes = data.x.size(0)
+            return data
+    raise FileNotFoundError(
+        f"Cannot find {dataset}.mat under {data_dir_path}, nor {dataset}.pt in current/data directory."
+    )
+
+
 def preprocess_features(features):
     """Row-normalize feature matrix and return dense float32 matrix."""
-    rowsum = np.array(features.sum(1), dtype=np.float32)
-    r_inv = np.zeros_like(rowsum, dtype=np.float32).flatten()
-    nz = rowsum.flatten() != 0
-    r_inv[nz] = 1.0 / rowsum.flatten()[nz]
+    rowsum = np.array(features.sum(1), dtype=np.float32).flatten()
+    r_inv = np.zeros_like(rowsum, dtype=np.float32)
+    nz = rowsum != 0
+    r_inv[nz] = 1.0 / rowsum[nz]
     r_inv[np.isinf(r_inv)] = 0.0
     r_inv[np.isnan(r_inv)] = 0.0
     r_mat_inv = sp.diags(r_inv)
     features = r_mat_inv.dot(features)
     return np.asarray(features.todense(), dtype=np.float32)
+
+
+def l2_normalize_features(features: np.ndarray) -> np.ndarray:
+    features = np.asarray(features, dtype=np.float32)
+    norm = np.linalg.norm(features, axis=1, keepdims=True)
+    norm[norm == 0] = 1.0
+    return features / norm
 
 
 def normalize_adj(adj):
@@ -202,7 +203,7 @@ def normalize_adj(adj):
     return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
 
 
-def build_neighbor_lists(edge_index: torch.Tensor, num_nodes: int, undirected: bool = True) -> List[List[int]]:
+def build_neighbor_lists(edge_index: torch.Tensor, num_nodes: int, undirected: bool = True) -> List[np.ndarray]:
     """Build CPU adjacency lists from PyG edge_index once and reuse them."""
     edge_np = edge_index.detach().cpu().long().numpy()
     neighbors = [set() for _ in range(num_nodes)]
@@ -214,34 +215,69 @@ def build_neighbor_lists(edge_index: torch.Tensor, num_nodes: int, undirected: b
         neighbors[src].add(dst)
         if undirected:
             neighbors[dst].add(src)
-    return [sorted(item) for item in neighbors]
+    return [np.asarray(sorted(item), dtype=np.int64) for item in neighbors]
 
 
-def _rwr_unique_trace(seed: int, neighbors: List[List[int]], restart_prob: float, max_steps: int) -> List[int]:
-    cur = seed
-    trace = [seed]
-    for _ in range(max_steps):
-        if random.random() < restart_prob or not neighbors[cur]:
-            cur = seed
-        else:
-            cur = random.choice(neighbors[cur])
-        trace.append(cur)
+def _rwr_one_node(
+    seed: int,
+    neighbors: List[np.ndarray],
+    subgraph_size: int,
+    rng: np.random.Generator,
+    restart_prob: float = 0.9,
+    max_steps: Optional[int] = None,
+    max_retries: int = 10,
+) -> List[int]:
+    """Generate one CGAD subgraph with the target node at the last position."""
+    reduced_size = subgraph_size - 1
+    if reduced_size <= 0:
+        return [seed]
+    if max_steps is None:
+        max_steps = max(subgraph_size * 5, 8)
 
-    # Preserve order while removing duplicates.
-    seen = set()
-    unique = []
-    for node in trace:
-        if node not in seen:
-            seen.add(node)
-            unique.append(node)
-    return unique
+    best = [seed]
+    for _ in range(max_retries + 1):
+        cur = seed
+        trace = [seed]
+        for _ in range(max_steps):
+            neigh = neighbors[cur]
+            if len(neigh) == 0 or rng.random() < restart_prob:
+                cur = seed
+            else:
+                cur = int(neigh[rng.integers(0, len(neigh))])
+            trace.append(cur)
+        seen = set()
+        unique = []
+        for node in trace:
+            if node not in seen:
+                seen.add(node)
+                unique.append(int(node))
+        if len(unique) > len(best):
+            best = unique
+        if len(unique) >= reduced_size:
+            best = unique
+            break
+
+    candidate = [v for v in best if v != seed]
+    if not candidate:
+        candidate = [seed]
+    while len(candidate) < reduced_size:
+        candidate.extend(candidate)
+    candidate = candidate[:reduced_size]
+    candidate.append(seed)
+    return candidate
 
 
-def generate_rwr_subgraph(edge_index_or_neighbors, subgraph_size: int, num_nodes: int = None):
-    """Generate RWR subgraphs using PyG edge_index / cached neighbor lists instead of DGL.
+def generate_rwr_subgraph(
+    edge_index_or_neighbors,
+    subgraph_size: int,
+    num_nodes: Optional[int] = None,
+    seed: Optional[int] = None,
+    restart_prob: float = 0.9,
+    max_retries: int = 10,
+):
+    """Generate RWR subgraphs using PyG edge_index or cached neighbor lists.
 
-    The returned subgraph keeps the original CGAD convention: the target node is
-    placed at the final position of each subgraph.
+    This replaces dgl.contrib.sampling.random_walk_with_restart and avoids DGL.
     """
     if isinstance(edge_index_or_neighbors, torch.Tensor):
         if num_nodes is None:
@@ -250,57 +286,113 @@ def generate_rwr_subgraph(edge_index_or_neighbors, subgraph_size: int, num_nodes
     else:
         neighbors = edge_index_or_neighbors
         num_nodes = len(neighbors)
+    rng = np.random.default_rng(seed)
+    return [
+        _rwr_one_node(i, neighbors, subgraph_size, rng, restart_prob=restart_prob, max_retries=max_retries)
+        for i in range(num_nodes)
+    ]
 
-    reduced_size = subgraph_size - 1
-    subgraphs = []
-    for node in range(num_nodes):
-        unique_nodes = _rwr_unique_trace(
-            node,
-            neighbors,
-            restart_prob=1.0,
-            max_steps=max(subgraph_size * 3, 1),
+
+def choose_sample_indices(subgraphs: np.ndarray, feature_l2: np.ndarray, strategy: str) -> np.ndarray:
+    """Choose positive neighbor position for every node.
+
+    This computes cosine scores only inside each small RWR subgraph, instead of
+    materialising an N x N cosine-similarity matrix.
+    """
+    subgraphs = np.asarray(subgraphs, dtype=np.int64)
+    nb_nodes = subgraphs.shape[0]
+    all_samples = np.empty(nb_nodes, dtype=np.int64)
+    if strategy == "random":
+        for nd in range(nb_nodes):
+            candidates = [pos for pos, node in enumerate(subgraphs[nd]) if int(node) != nd]
+            if not candidates:
+                candidates = [subgraphs.shape[1] - 1]
+            all_samples[nd] = random.choice(candidates)
+        return all_samples
+
+    for nd in range(nb_nodes):
+        row = subgraphs[nd]
+        positions = [pos for pos, node in enumerate(row) if int(node) != nd]
+        if not positions:
+            all_samples[nd] = subgraphs.shape[1] - 1
+            continue
+        cand_nodes = row[positions]
+        sims = feature_l2[cand_nodes] @ feature_l2[nd]
+        best_pos = int(np.argmin(sims) if strategy == "least-relevant" else np.argmax(sims))
+        all_samples[nd] = positions[best_pos]
+    return all_samples
+
+
+def prepare_subgraph_bank(
+    neighbor_lists: List[np.ndarray],
+    subgraph_size: int,
+    feature_l2: np.ndarray,
+    strategy: str,
+    rounds: int,
+    seed: int,
+    cache_path: Optional[Path] = None,
+    force: bool = False,
+    restart_prob: float = 0.9,
+    max_retries: int = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate/load a bank of RWR subgraphs and corresponding sample positions.
+
+    Returns:
+        subgraph_bank: [R, N, S] int64
+        sample_bank:   [R, N] int64
+    """
+    rounds = max(int(rounds), 1)
+    if cache_path is not None:
+        cache_path = Path(cache_path)
+        if cache_path.exists() and not force:
+            pack = np.load(cache_path)
+            subgraph_bank = pack["subgraph_bank"].astype(np.int64, copy=False)
+            sample_bank = pack["sample_bank"].astype(np.int64, copy=False)
+            if subgraph_bank.shape[0] >= rounds and subgraph_bank.shape[2] == subgraph_size:
+                return subgraph_bank[:rounds], sample_bank[:rounds]
+
+    subgraphs_all = []
+    samples_all = []
+    for r in range(rounds):
+        subgraphs = np.asarray(
+            generate_rwr_subgraph(
+                neighbor_lists,
+                subgraph_size,
+                seed=seed + r,
+                restart_prob=restart_prob,
+                max_retries=max_retries,
+            ),
+            dtype=np.int64,
         )
-        retry_time = 0
-        while len(unique_nodes) < reduced_size:
-            unique_nodes = _rwr_unique_trace(
-                node,
-                neighbors,
-                restart_prob=0.9,
-                max_steps=max(subgraph_size * 5, 1),
-            )
-            retry_time += 1
-            if len(unique_nodes) <= 2 and retry_time > 10:
-                break
+        samples = choose_sample_indices(subgraphs, feature_l2, strategy)
+        subgraphs_all.append(subgraphs.astype(np.int32))
+        samples_all.append(samples.astype(np.int16 if subgraph_size < 32767 else np.int32))
 
-        candidate = [v for v in unique_nodes if v != node]
-        if not candidate:
-            candidate = [node]
-        while len(candidate) < reduced_size:
-            candidate.extend(candidate)
-        candidate = candidate[:reduced_size]
-        candidate.append(node)
-        subgraphs.append(candidate)
-    return subgraphs
+    subgraph_bank = np.stack(subgraphs_all, axis=0)
+    sample_bank = np.stack(samples_all, axis=0)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache_path, subgraph_bank=subgraph_bank, sample_bank=sample_bank)
+    return subgraph_bank.astype(np.int64), sample_bank.astype(np.int64)
 
 
-def generate_coef(features: np.ndarray) -> np.ndarray:
-    """Generate feature cosine-similarity matrix used by CGAD sample selection."""
-    if sp.issparse(features):
-        features = features.toarray()
-    features = np.asarray(features, dtype=np.float32)
-    coef = cosine_similarity(features)
-    return np.asarray(coef, dtype=np.float32)
+def resolve_preprocess_paths(args) -> Tuple[Path, Path]:
+    if getattr(args, "cache_dir", None):
+        cache_dir = _expand_path(args.cache_dir)
+    else:
+        train_dir = _expand_path(getattr(args, "train_dir", "./runs"))
+        cache_dir = train_dir / "cgad_preprocess"
+    community_path = cache_dir / f"{args.dataset}.json"
+    return cache_dir, community_path
 
 
 def _largest_remainder_partition(nodecom: List[int], max_communities: int) -> List[int]:
-    """Merge surplus communities into [0, max_communities - 1] ids."""
     if max_communities <= 0:
         return nodecom
     uniq = sorted(set(nodecom))
     if len(uniq) <= max_communities:
         remap = {cid: i for i, cid in enumerate(uniq)}
         return [remap[cid] for cid in nodecom]
-
     counts = Counter(nodecom)
     keep = [cid for cid, _ in counts.most_common(max_communities)]
     keep_set = set(keep)
@@ -310,7 +402,6 @@ def _largest_remainder_partition(nodecom: List[int], max_communities: int) -> Li
         if cid in keep_set:
             merged.append(remap[cid])
         else:
-            # Assign remaining communities deterministically.
             merged.append(idx % max_communities)
     return merged
 
@@ -322,11 +413,9 @@ def generate_community(
     seed: int = 1,
     max_communities: int = 0,
 ) -> List[int]:
-    """Generate community id for every node, replacing the original external json."""
     graph = nx.Graph()
     graph.add_nodes_from(range(num_nodes))
     graph.add_edges_from(edge_index.detach().cpu().long().t().tolist())
-
     if method == "louvain" and hasattr(nx.community, "louvain_communities"):
         communities = nx.community.louvain_communities(graph, seed=seed)
     elif method == "greedy":
@@ -334,7 +423,6 @@ def generate_community(
     elif method == "components":
         communities = list(nx.connected_components(graph))
     else:
-        # Safe fallback for older networkx versions.
         try:
             communities = nx.community.greedy_modularity_communities(graph)
         except Exception:
@@ -351,24 +439,28 @@ def generate_community(
 
 
 def load_or_generate_preprocess(data: Data, args):
-    """Load cached community/coef if available, otherwise generate them automatically.
+    """Load cached community labels or generate them once.
 
-    Cache is kept in memory after the first load/generation, so grid search does
-    not repeatedly read the same .json/.pkl files from disk.
+    Unlike the original implementation, this function no longer computes/stores
+    a dense N x N cosine matrix by default; sample selection is computed locally
+    inside each small subgraph.
     """
-    cache_dir, community_path, coef_path = resolve_preprocess_paths(args)
+    cache_dir, community_path = resolve_preprocess_paths(args)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # Backward compatibility: prefer existing ./dataset.json when cache does not exist.
+    local_json = Path(f"{args.dataset}.json")
+    if not community_path.exists() and local_json.exists() and not getattr(args, "force_preprocess", False):
+        community_path = local_json
+
     community_mtime = community_path.stat().st_mtime if community_path.exists() else -1.0
-    coef_mtime = coef_path.stat().st_mtime if coef_path.exists() else -1.0
     cache_key = (
         args.dataset,
-        str(cache_dir),
+        str(community_path),
         getattr(args, "community_method", "louvain"),
         int(getattr(args, "max_communities", 0)),
         int(getattr(args, "seed", 1)),
         community_mtime,
-        coef_mtime,
     )
     if not getattr(args, "force_preprocess", False) and cache_key in _PREPROCESS_CACHE:
         return _PREPROCESS_CACHE[cache_key]
@@ -384,53 +476,35 @@ def load_or_generate_preprocess(data: Data, args):
         _atomic_json_dump({"com": nodecom}, community_path)
     else:
         with open(community_path, encoding="utf8") as f:
-            nodecom = json.load(f)["com"]
+            text = f.read().strip()
+            nodecom = json.loads(text)["com"]
 
-    if getattr(args, "force_preprocess", False) or not coef_path.exists():
-        coef = generate_coef(data.x.detach().cpu().numpy())
-        _atomic_pickle_dump(coef, coef_path)
-    else:
-        with open(coef_path, "rb") as f:
-            coef = pickle.load(f)
-    coef = np.asarray(coef, dtype=np.float32)
-
-    # Refresh mtime after possible generation.
-    community_mtime = community_path.stat().st_mtime if community_path.exists() else -1.0
-    coef_mtime = coef_path.stat().st_mtime if coef_path.exists() else -1.0
-    cache_key = (
-        args.dataset,
-        str(cache_dir),
-        getattr(args, "community_method", "louvain"),
-        int(getattr(args, "max_communities", 0)),
-        int(getattr(args, "seed", 1)),
-        community_mtime,
-        coef_mtime,
-    )
-    _PREPROCESS_CACHE[cache_key] = (nodecom, coef, community_path, coef_path)
-    return nodecom, coef, community_path, coef_path
+    # Ensure community ids are contiguous, because the sampler uses them as array ids.
+    uniq = sorted(set(nodecom))
+    remap = {cid: i for i, cid in enumerate(uniq)}
+    nodecom = [remap[cid] for cid in nodecom]
+    result = (nodecom, community_path)
+    _PREPROCESS_CACHE[cache_key] = result
+    return result
 
 
 def get_scores(actual, score, k=None):
     """Return ROC-AUC, PR-AUC and Recall@K.
 
-    AUPRC is intentionally computed by scikit-learn's
-    precision_recall_curve + auc, rather than average_precision_score.
+    AUPRC is computed by sklearn.precision_recall_curve + sklearn.auc.
     """
     actual = np.asarray(actual).astype(int).reshape(-1)
     score = np.asarray(score, dtype=float).reshape(-1)
     if actual.shape[0] != score.shape[0]:
         raise ValueError(f"actual length {actual.shape[0]} != score length {score.shape[0]}")
-
     positives = int(actual.sum())
     has_two_classes = len(np.unique(actual)) == 2
     auc_value = float(roc_auc_score(actual, score)) if has_two_classes else float("nan")
-
     if positives > 0:
         precision, recall, _ = precision_recall_curve(actual, score)
         auprc_value = float(sk_auc(recall, precision))
     else:
         auprc_value = float("nan")
-
     if k is None:
         k = positives
     k = max(int(k), 1)
@@ -440,27 +514,6 @@ def get_scores(actual, score, k=None):
     else:
         rec = float("nan")
     return auc_value, auprc_value, rec
-
-
-def get_one_sample(subgraph_size, nb_nodes, coef, subgraphs, strategy):
-    all_samples = []
-    for nd in range(nb_nodes):
-        neighbors = list(set(subgraphs[nd]))
-        if nd in neighbors:
-            neighbors.remove(nd)
-        if not neighbors:
-            neighbors = [nd]
-
-        if strategy == "random":
-            chosen = random.sample(neighbors, 1)[0]
-        elif strategy == "least-relevant":
-            coefs = [coef[nd][neb] for neb in neighbors]
-            chosen = neighbors[int(np.argmin(coefs))]
-        else:
-            coefs = [coef[nd][neb] for neb in neighbors]
-            chosen = neighbors[int(np.argmax(coefs))]
-        all_samples.append(subgraphs[nd].index(chosen))
-    return np.asarray(all_samples, dtype=np.int64)
 
 
 def RemoveIsolated(data):
@@ -481,46 +534,80 @@ def RemoveIsolated(data):
     return data
 
 
-def get_negs(idx, nodecom, communities, Com_size_ratio, num_negs, neg_sample_method):
-    if len(idx) <= 1:
-        return np.zeros((num_negs, len(idx)), dtype=np.int64)
+def get_one_sample(subgraph_size, nb_nodes, coef, subgraphs, strategy):
+    """Backward-compatible wrapper.
 
-    if neg_sample_method == "random" or len(communities) <= 1:
-        neg_node = list(range(len(idx)))
-        negs = []
-        for _ in range(num_negs):
-            each_negs = random.choices(neg_node, k=len(idx))
-            for i, value in enumerate(each_negs):
-                if value == i:
-                    each_negs[i] = (value + 1) % len(idx)
-            negs.append(each_negs)
-        return np.asarray(negs, dtype=np.int64)
+    Prefer choose_sample_indices(subgraphs, feature_l2, strategy) in new code.
+    """
+    all_samples = []
+    for nd in range(nb_nodes):
+        neighbors = list(set(subgraphs[nd]))
+        if nd in neighbors:
+            neighbors.remove(nd)
+        if not neighbors:
+            neighbors = [nd]
+        if strategy == "random":
+            chosen = random.sample(neighbors, 1)[0]
+        elif strategy == "least-relevant":
+            coefs = [coef[nd][neb] for neb in neighbors]
+            chosen = neighbors[int(np.argmin(coefs))]
+        else:
+            coefs = [coef[nd][neb] for neb in neighbors]
+            chosen = neighbors[int(np.argmax(coefs))]
+        all_samples.append(subgraphs[nd].index(chosen))
+    return np.asarray(all_samples, dtype=np.int64)
 
-    mapper = {node: i for i, node in enumerate(idx)}
-    com_to_pos = []
-    for com in communities:
-        nodes = [mapper[nd] for nd in idx if nodecom[nd] == com]
-        com_to_pos.append(nodes)
 
-    negs = []
-    for nd in idx:
-        nd_com = nodecom[nd]
-        candidate_coms = [com for com in communities if com != nd_com and len(com_to_pos[com]) > 0]
-        if not candidate_coms:
-            candidates = [i for i in range(len(idx)) if i != mapper[nd]]
-            negs.append(random.choices(candidates, k=num_negs))
+def get_negs_fast(
+    idx: Sequence[int],
+    nodecom: Sequence[int],
+    num_negs: int,
+    neg_sample_method: str = "bias",
+) -> np.ndarray:
+    """Batch-aware negative sampler.
+
+    Returns negative sample *positions inside the current batch*, shape [K, B].
+    It avoids repeatedly building Python dicts/lists for every community in the
+    whole graph, and handles empty communities in small batches.
+    """
+    idx = np.asarray(idx, dtype=np.int64)
+    batch_size = idx.shape[0]
+    if batch_size <= 1:
+        return np.zeros((num_negs, batch_size), dtype=np.int64)
+
+    if neg_sample_method == "random":
+        negs = np.random.randint(0, batch_size, size=(num_negs, batch_size), dtype=np.int64)
+        cols = np.arange(batch_size)
+        same = negs == cols[None, :]
+        negs[same] = (negs[same] + 1) % batch_size
+        return negs
+
+    nodecom_np = np.asarray(nodecom, dtype=np.int64)
+    batch_com = nodecom_np[idx]
+    max_com = int(batch_com.max()) if batch_com.size else 0
+    com_to_pos = [np.flatnonzero(batch_com == c) for c in range(max_com + 1)]
+    non_empty = np.asarray([c for c, pos in enumerate(com_to_pos) if len(pos) > 0], dtype=np.int64)
+    negs = np.empty((num_negs, batch_size), dtype=np.int64)
+
+    for col in range(batch_size):
+        cur_com = int(batch_com[col])
+        cand_coms = non_empty[non_empty != cur_com]
+        if cand_coms.size == 0:
+            candidates = np.delete(np.arange(batch_size, dtype=np.int64), col)
+            negs[:, col] = np.random.choice(candidates, size=num_negs, replace=True)
             continue
-
         if neg_sample_method == "bias":
-            weights = []
-            original_candidates = [c for c in communities if c != nd_com]
-            for com in candidate_coms:
-                pos = original_candidates.index(com)
-                weights.append(Com_size_ratio[nd_com][pos])
-        else:  # even
-            weights = [1.0] * len(candidate_coms)
+            weights = np.asarray([len(com_to_pos[int(c)]) for c in cand_coms], dtype=np.float64)
+            weights = weights / weights.sum()
+        else:
+            weights = None
+        selected_coms = np.random.choice(cand_coms, size=num_negs, replace=True, p=weights)
+        for k, com in enumerate(selected_coms):
+            choices = com_to_pos[int(com)]
+            negs[k, col] = int(choices[np.random.randint(0, len(choices))])
+    return negs
 
-        selected_coms = random.choices(candidate_coms, weights=weights, k=num_negs)
-        selected = [random.choice(com_to_pos[com]) for com in selected_coms]
-        negs.append(selected)
-    return np.asarray(negs, dtype=np.int64).T
+
+def get_negs(idx, nodecom, communities, Com_size_ratio, num_negs, neg_sample_method):
+    """Backward-compatible name used by older run.py."""
+    return get_negs_fast(idx, nodecom, num_negs, neg_sample_method)
