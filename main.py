@@ -1,140 +1,73 @@
+from __future__ import annotations
 
-import tqdm
-import torch
 import argparse
-import warnings
-from pygod.metrics import *
 import os
-import json
-from run import *
-from utils import *
+
+import numpy as np
+
+from run.run import train_ours
+from utils.utils import get_scores
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ['OMP_NUM_THREADS'] = '1'
-
-parser = argparse.ArgumentParser(description='Com')
-parser.add_argument('--expid', type=int)
-parser.add_argument('--device', type=str, default='cuda:0')
-parser.add_argument('--runs', type=int, default=1)
-parser.add_argument('--dataset', type=str, default='inj_cora')
-parser.add_argument('--readout', type=str, default='avg')
-
-parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--weight_decay', type=float, default = 0)
-parser.add_argument('--embedding_dim', type=int, default = 64)
-parser.add_argument('--patience', type=int, default=20)
-parser.add_argument('--num_epoch', type=int, default= 100)  
-parser.add_argument('--batch_size', type=int, default = 256)
-parser.add_argument('--subgraph_size', type=int, default = 4 )    
-parser.add_argument('--auc_test_rounds', type=int, default = 100) 
-
-parser.add_argument('--num_community', type=int, default = 3)   
-parser.add_argument('--neg_sample_method', type=str, default = 'bias')  #bias,even, random 
-parser.add_argument('--num_negs', type=int, default = 3)   
-
-parser.add_argument('--strategy', type=str, default='most-relevant')  #random, least-relevant 
-parser.add_argument('--alpha', type=float, default = 0.5, help='how much node-level involves')
-
-parser.add_argument('--loss_fun', type=str, default = 'rnce', help='loss function')
-parser.add_argument('--lam', type=float, default = 0.5, help ='how much neg pairs involves')
-parser.add_argument('--T', type=float, default = 1)   
-parser.add_argument('--q', type=float, default = 0.3)   
-
-args = parser.parse_args()
+os.environ["OMP_NUM_THREADS"] = "1"
 
 
-lrs1= [1e-3, 5e-4]
-lrs2 = [1e-2, 5e-3]
-bs1 = [512, 1024]
-bs2 = [32,64]
-ems1 = [64,128]
-ems2 = [12,16]
-ems3 = [32,48]  
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CGAD PyG refactor without DGL")
+    parser.add_argument("--expid", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--dataset", type=str, default="inj_cora")
+    parser.add_argument("--data_dir", type=str, default="./dataset", help="Directory containing <dataset>.pt/.json/.txt")
+    parser.add_argument("--readout", type=str, default="avg", choices=["avg", "max", "min", "weighted_sum"])
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--embedding_dim", type=int, default=64)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--num_epoch", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--subgraph_size", type=int, default=4)
+    parser.add_argument("--auc_test_rounds", type=int, default=100)
+    parser.add_argument("--num_community", type=int, default=3)
+    parser.add_argument("--neg_sample_method", type=str, default="bias", choices=["bias", "even", "random"])
+    parser.add_argument("--num_negs", type=int, default=3)
+    parser.add_argument("--strategy", type=str, default="most-relevant", choices=["random", "most-relevant", "least-relevant"])
+    parser.add_argument("--alpha", type=float, default=0.5, help="Weight of node-level contrastive loss/score")
+    parser.add_argument("--loss_fun", type=str, default="rnce", choices=["rnce"])
+    parser.add_argument("--lam", type=float, default=0.5, help="Negative-pair weight in RNCE")
+    parser.add_argument("--T", type=float, default=1.0, help="Contrastive temperature")
+    parser.add_argument("--q", type=float, default=0.3, help="RNCE q parameter")
+    parser.add_argument("--restart_prob", type=float, default=0.9, help="RWR restart probability")
+    parser.add_argument("--rwr_max_steps", type=int, default=None, help="Max walk steps per seed; default=max(20, subgraph_size*10)")
+    return parser
 
 
-if args.dataset in ['inj_cora']:
-    lrs = lrs1
-    ems = ems1
-    bs = bs1
-    args.num_community = 10
-    coms = [3,5,8,10,15]
+def apply_dataset_defaults(args):
+    """Keep the original dataset-specific defaults while allowing CLI overrides."""
+    if args.dataset == "inj_cora":
+        args.num_community = 10
+    elif args.dataset == "books":
+        args.num_community = 10
+    elif args.dataset == "disney":
+        args.num_community = 3
+    elif args.dataset == "reddit":
+        args.num_epoch = min(args.num_epoch, 10)
+        args.auc_test_rounds = min(args.auc_test_rounds, 10)
+        args.num_community = 3
+    return args
 
 
-if args.dataset in ['books']:
-    lrs = lrs2
-    ems = ems2
-    bs = bs1
-    args.num_community = 10
-    coms = [3,5,8,10,15]
-    
-
-if args.dataset in [ 'disney']:
-    lrs = lrs2
-    ems = ems2
-    bs = bs2   
-    args.num_community = 3
-#    num_negs = [1, 3, 5]
-#    coms = [3, 4, 5, 8]
-
-if args.dataset in ['reddit']:
-    lrs = lrs1
-    ems = ems3
-    bs = bs1
-    args.num_epoch = 10
-    args.auc_test_rounds = 10
-    args.num_community = 3
-    coms = [3,5,8,10,15]
+def main() -> None:
+    args = apply_dataset_defaults(build_parser().parse_args())
+    labels, scores = train_ours(args)
+    k = int(np.sum(labels))
+    auc, ap, recall = get_scores(labels, scores, k)
+    print("\nFinal metric")
+    print(f"AUC: {auc:.6f}")
+    print(f"AUPRC/AP: {ap:.6f}")
+    print(f"Recall@K: {recall:.6f}")
 
 
-
-ave_results = []
-for args.lr in lrs:
-    for args.batch_size in bs:
-        for args.embedding_dim in ems:
-            print('\n==============================')
-            print( args.lr, args.batch_size,args.embedding_dim)
-        
-            #train
-            ano_label,ano_score_final = train_ours(args)
-            k = sum(ano_label)
-        
-            #compute index
-            auc, ap, recall = get_scores(ano_label,ano_score_final ,k)
-            metric = [args.lr, args.batch_size,args.embedding_dim, auc, ap,recall]
-
-            #average performance
-            ave_results.append([auc, ap, recall])
-final_metric = np.mean(ave_results,0)
-print(final_metric)
-            
-            
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    main()
