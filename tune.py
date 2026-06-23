@@ -1,19 +1,30 @@
 """
-Optuna tuning script for 2024-CGAD with NaN/Inf score protection.
+Optuna tuning script for 2024-CGAD that saves the best training command.
 
 Put this file in the project root of https://github.com/weiranli-cjlu/2024-CGAD
 and run, for example:
 
     pip install optuna scikit-learn
-    python optuna_tune_cgad_nan_guard.py --dataset cora --data_dir ~/datasets/GAD/mat \
-        --n_trials 50 --num_epoch 100 --auc_test_rounds 50 --device cuda:0 --quiet
+    python optuna_tune_cgad_save_command.py \
+        --dataset cora \
+        --data_dir ~/datasets/GAD/mat \
+        --device cuda:0 \
+        --n_trials 50 \
+        --num_epoch 100 \
+        --auc_test_rounds 50 \
+        --quiet
 
-What this version fixes:
-- If y_score contains NaN/Inf, the trial is marked as unstable and pruned instead of
-  crashing Optuna or writing invalid AUC/AUPRC values.
-- If y_score is entirely NaN/Inf, the trial is always pruned because metrics are meaningless.
-- Each invalid trial records score diagnostics in user_attrs and the exported CSV.
-- The default search space is slightly safer for CGAD's exp/logit-based RNCE loss.
+Outputs under --output_dir:
+- <study_name>.db                         Optuna sqlite study
+- <study_name>_trials.csv                 all trials and metrics
+- <study_name>_best.json                  best params, metrics, command
+- <study_name>_best_train_command.txt     single-line reproducible command
+- <study_name>_best_train_command.sh      executable shell script
+
+Notes:
+- AUPRC is computed with sklearn.metrics.precision_recall_curve + sklearn.metrics.auc.
+- Trials with NaN/Inf y_score are pruned by default so tuning continues.
+- The saved command calls the repository's main.py using the best hyperparameters.
 """
 
 from __future__ import annotations
@@ -24,6 +35,7 @@ import csv
 import gc
 import json
 import os
+import shlex
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -49,15 +61,31 @@ class NonFiniteScoreError(ValueError):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Optuna tuner for CGAD with NaN guards")
+    parser = argparse.ArgumentParser(
+        description="Optuna tuner for CGAD; saves best python main.py training command"
+    )
 
-    # CGAD fixed experiment options.
+    # Fixed CGAD experiment options.
     parser.add_argument("--dataset", type=str, default="cora")
     parser.add_argument("--data_dir", type=str, default="~/datasets/GAD/mat")
-    parser.add_argument("--cache_dir", type=str, default="~/datasets/GAD/mat/cgad_preprocess")
+    parser.add_argument(
+        "--train_dir",
+        type=str,
+        default="./runs",
+        help="Training directory that will be written into the saved best command.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help=(
+            "Preprocess cache directory. If omitted, the saved command also omits --cache_dir "
+            "so current main.py saves cache under <train_dir>/cgad_preprocess."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--runs", type=int, default=1, help="CGAD internal runs per Optuna trial")
+    parser.add_argument("--runs", type=int, default=1, help="CGAD internal runs per Optuna trial and saved command")
     parser.add_argument("--num_epoch", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--auc_test_rounds", type=int, default=100)
@@ -65,6 +93,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_communities", type=int, default=0, help="0 means keep all generated communities")
     parser.add_argument("--force_preprocess", action="store_true")
     parser.add_argument("--quiet", action="store_true", help="suppress train_ours stdout logs during each trial")
+
+    # Saved command options.
+    parser.add_argument(
+        "--best_command_prefix",
+        type=str,
+        default="python main.py",
+        help="Command prefix used when saving the final best training instruction.",
+    )
+    parser.add_argument(
+        "--best_results_csv",
+        type=str,
+        default=None,
+        help=(
+            "results_csv path written into the saved best command. "
+            "Default: <output_dir>/<study_name>_best_train_results.csv"
+        ),
+    )
+    parser.add_argument(
+        "--save_score_run",
+        type=int,
+        default=-1,
+        help="Passed to saved best command; <=0 means do not save y_true/y_score.",
+    )
+    parser.add_argument(
+        "--score_save_dir",
+        type=str,
+        default=None,
+        help="Passed to saved best command when --save_score_run > 0.",
+    )
 
     # NaN/Inf handling.
     parser.add_argument(
@@ -103,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampler_seed", type=int, default=42)
     parser.add_argument("--enqueue_default", action="store_true", help="evaluate current main.py defaults as the first trial")
 
-    # Optional search-space controls. Defaults are conservative to reduce exp/logit overflow.
+    # Search-space controls. Defaults are conservative to reduce exp/logit overflow.
     parser.add_argument("--min_lr", type=float, default=1e-5)
     parser.add_argument("--max_lr", type=float, default=5e-3)
     parser.add_argument("--embedding_dims", type=str, default="32,48,64,96,128")
@@ -155,6 +212,7 @@ def build_cgad_args(cli: argparse.Namespace, trial: optuna.trial.Trial) -> Simpl
     args.seed = cli.seed + trial.number * 1000
     args.dataset = cli.dataset
     args.data_dir = cli.data_dir
+    args.train_dir = cli.train_dir
     args.cache_dir = cli.cache_dir
     args.force_preprocess = cli.force_preprocess
     args.community_method = cli.community_method
@@ -283,8 +341,8 @@ def compute_metrics(y_true: Iterable[int], y_score: Iterable[float], cli: argpar
 
     auc_value = float(roc_auc_score(y_true_arr, y_score_arr))
 
-    # sklearn.precision_recall_curve returns recall in descending order in common cases;
-    # reverse it before trapezoidal auc so x-axis is increasing.
+    # precision_recall_curve usually returns recall in descending order;
+    # reverse before trapezoidal auc so the x-axis is increasing.
     precision, recall, _ = precision_recall_curve(y_true_arr, y_score_arr)
     auprc_value = float(sklearn_auc(recall[::-1], precision[::-1]))
 
@@ -314,6 +372,91 @@ def objective_value(metrics: Dict[str, float], objective_metric: str) -> float:
 
 def flatten_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return {f"param_{k}": v for k, v in params.items()}
+
+
+def shell_join(tokens: List[Any]) -> str:
+    return " ".join(shlex.quote(str(token)) for token in tokens)
+
+
+def build_best_training_command(
+    best_params: Dict[str, Any],
+    cli: argparse.Namespace,
+) -> str:
+    """Build a reproducible command that calls the repository main.py with best params."""
+    tokens: List[Any] = shlex.split(cli.best_command_prefix)
+
+    # Fixed options from current main.py.
+    tokens += [
+        "--dataset", cli.dataset,
+        "--data_dir", cli.data_dir,
+        "--train_dir", cli.train_dir,
+        "--device", cli.device,
+        "--runs", 10,
+        "--seed", cli.seed,
+        "--num_epoch", cli.num_epoch,
+        "--patience", cli.patience,
+        "--auc_test_rounds", cli.auc_test_rounds,
+        "--community_method", cli.community_method,
+        "--max_communities", cli.max_communities,
+    ]
+
+    if cli.cache_dir is not None:
+        tokens += ["--cache_dir", cli.cache_dir]
+    if cli.force_preprocess:
+        tokens += ["--force_preprocess"]
+    if cli.save_score_run > 0:
+        tokens += ["--save_score_run", cli.save_score_run]
+        if cli.score_save_dir is not None:
+            tokens += ["--score_save_dir", cli.score_save_dir]
+
+    # Best Optuna parameters that are accepted by main.py.
+    param_order = [
+        "lr",
+        "weight_decay",
+        "embedding_dim",
+        "batch_size",
+        "subgraph_size",
+        "readout",
+        "neg_sample_method",
+        "num_negs",
+        "strategy",
+        "alpha",
+        "lam",
+        "T",
+        "q",
+    ]
+    for key in param_order:
+        if key in best_params:
+            tokens += [f"--{key}", best_params[key]]
+
+    # main.py keeps this argument for compatibility.
+    tokens += ["--loss_fun", "rnce"]
+
+    return shell_join(tokens)
+
+
+def save_best_command_files(
+    study: optuna.Study,
+    cli: argparse.Namespace,
+    output_dir: Path,
+) -> Dict[str, str]:
+    """Save best training command as .txt and executable .sh."""
+    try:
+        best = study.best_trial
+    except ValueError:
+        return {}
+
+    command = build_best_training_command(best.params, cli)
+
+    sh_path = output_dir / f"{cli.study_name}_best_train_command.sh"
+
+    sh_path.write_text(command + "\n", encoding="utf-8")
+    sh_path.chmod(0o755)
+
+    return {
+        "best_train_command": command,
+        "best_train_command_sh": str(sh_path),
+    }
 
 
 def export_trials_csv(study: optuna.Study, csv_path: Path, cli: argparse.Namespace) -> None:
@@ -368,7 +511,7 @@ def export_trials_csv(study: optuna.Study, csv_path: Path, cli: argparse.Namespa
             writer.writerow(row)
 
 
-def save_best_json(study: optuna.Study, path: Path, cli: argparse.Namespace) -> None:
+def save_best_json(study: optuna.Study, path: Path, cli: argparse.Namespace, command_payload: Dict[str, str]) -> None:
     try:
         best = study.best_trial
     except ValueError:
@@ -379,6 +522,9 @@ def save_best_json(study: optuna.Study, path: Path, cli: argparse.Namespace) -> 
         "best_trial": best.number,
         "best_value": best.value,
         "best_params": best.params,
+        "best_train_command": command_payload.get("best_train_command"),
+        "best_train_command_sh": command_payload.get("best_train_command_sh"),
+        "best_train_results_csv": command_payload.get("best_train_results_csv"),
         "metrics": {
             "auc": best.user_attrs.get("auc"),
             "auprc": best.user_attrs.get("auprc"),
@@ -386,14 +532,17 @@ def save_best_json(study: optuna.Study, path: Path, cli: argparse.Namespace) -> 
         },
         "fixed_args": {
             "data_dir": cli.data_dir,
+            "train_dir": cli.train_dir,
             "cache_dir": cli.cache_dir,
             "device": cli.device,
             "runs": cli.runs,
+            "seed": cli.seed,
             "num_epoch": cli.num_epoch,
             "patience": cli.patience,
             "auc_test_rounds": cli.auc_test_rounds,
             "community_method": cli.community_method,
             "max_communities": cli.max_communities,
+            "force_preprocess": cli.force_preprocess,
             "nan_policy": cli.nan_policy,
             "min_finite_score_ratio": cli.min_finite_score_ratio,
         },
@@ -476,8 +625,6 @@ def main() -> None:
             return value
 
         except NonFiniteScoreError as exc:
-            # The most common case: unstable hyperparameters caused exp/logit overflow,
-            # making y_score all NaN. Prune it and continue the search.
             try:
                 if "y_score" in locals():
                     _set_trial_attrs(trial, score_diagnostics(np.asarray(y_score, dtype=np.float64)))
@@ -503,7 +650,8 @@ def main() -> None:
 
     def callback(study_obj: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         export_trials_csv(study_obj, trials_csv, cli)
-        save_best_json(study_obj, best_json, cli)
+        command_payload = save_best_command_files(study_obj, cli, output_dir)
+        save_best_json(study_obj, best_json, cli, command_payload)
         if trial.state == optuna.trial.TrialState.COMPLETE:
             auc_v = trial.user_attrs.get("auc", float("nan"))
             auprc_v = trial.user_attrs.get("auprc", float("nan"))
@@ -523,7 +671,8 @@ def main() -> None:
     study.optimize(objective, n_trials=cli.n_trials, timeout=cli.timeout, callbacks=[callback], gc_after_trial=True, show_progress_bar=True)
 
     export_trials_csv(study, trials_csv, cli)
-    save_best_json(study, best_json, cli)
+    command_payload = save_best_command_files(study, cli, output_dir)
+    save_best_json(study, best_json, cli, command_payload)
 
     print("\n========== Optuna tuning finished ==========")
     print(f"Study name: {cli.study_name}")
@@ -535,8 +684,15 @@ def main() -> None:
         print(f"Best value ({cli.objective_metric}): {study.best_value:.6f}")
         print("Best params:")
         print(json.dumps(study.best_params, ensure_ascii=False, indent=2))
+        if command_payload:
+            print("Best training command:")
+            print(command_payload["best_train_command"])
+            print(f"Best command sh: {command_payload['best_train_command_sh']}")
     except ValueError:
-        print("No completed trial. Most trials may have produced NaN/Inf scores. Try reducing --max_lr, --max_q, --max_lam or increasing --min_T.")
+        print(
+            "No completed trial. Most trials may have produced NaN/Inf scores. "
+            "Try reducing --max_lr, --max_q, --max_lam or increasing --min_T."
+        )
 
 
 if __name__ == "__main__":
