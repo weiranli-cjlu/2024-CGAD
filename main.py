@@ -1,11 +1,12 @@
 import argparse
 import os
 import warnings
+from copy import copy
 
 import numpy as np
 
 from run.run import train_ours
-from utils.utils import get_scores
+from utils.utils import get_scores, resolve_preprocess_paths
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -14,16 +15,43 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CGAD PyG + .mat refactor")
+
     parser.add_argument("--expid", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--dataset", type=str, default="cora")
+
+    # Dataset files still live in data_dir. Generated preprocessing files no longer
+    # default to data_dir/cgad_preprocess; by default they are placed under the
+    # training directory: <train_dir>/cgad_preprocess/<dataset>.json|pkl.
     parser.add_argument("--data_dir", type=str, default="~/datasets/GAD/mat")
-    parser.add_argument("--cache_dir", type=str, default="~/datasets/GAD/mat/cgad_preprocess")
+    parser.add_argument(
+        "--train_dir",
+        type=str,
+        default="./runs",
+        help="Training output directory. Default preprocess cache is saved here.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Optional explicit preprocess cache directory. Overrides --train_dir.",
+    )
     parser.add_argument("--force_preprocess", action="store_true")
-    parser.add_argument("--community_method", type=str, default="louvain", choices=["louvain", "greedy", "components"])
-    parser.add_argument("--max_communities", type=int, default=0, help="0 means keep all generated communities")
+
+    parser.add_argument(
+        "--community_method",
+        type=str,
+        default="louvain",
+        choices=["louvain", "greedy", "components"],
+    )
+    parser.add_argument(
+        "--max_communities",
+        type=int,
+        default=0,
+        help="0 means keep all generated communities",
+    )
 
     parser.add_argument("--readout", type=str, default="avg")
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -35,15 +63,26 @@ def parse_args():
     parser.add_argument("--subgraph_size", type=int, default=4)
     parser.add_argument("--auc_test_rounds", type=int, default=100)
     parser.add_argument("--num_community", type=int, default=3)  # kept for compatibility
-    parser.add_argument("--neg_sample_method", type=str, default="bias", choices=["bias", "even", "random"])
+    parser.add_argument(
+        "--neg_sample_method",
+        type=str,
+        default="bias",
+        choices=["bias", "even", "random"],
+    )
     parser.add_argument("--num_negs", type=int, default=3)
-    parser.add_argument("--strategy", type=str, default="most-relevant", choices=["random", "most-relevant", "least-relevant"])
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="most-relevant",
+        choices=["random", "most-relevant", "least-relevant"],
+    )
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--loss_fun", type=str, default="rnce")
     parser.add_argument("--lam", type=float, default=0.5)
     parser.add_argument("--T", type=float, default=1.0)
     parser.add_argument("--q", type=float, default=0.3)
     parser.add_argument("--grid_search", action="store_true", help="Run original-style small grid search")
+
     return parser.parse_args()
 
 
@@ -72,22 +111,31 @@ def dataset_default_grid(args):
 
 def main():
     args = parse_args()
-    ave_results = []
+    cache_dir, community_path, coef_path = resolve_preprocess_paths(args)
+    print(f"Preprocess cache directory: {cache_dir}")
+    print(f"Expected community cache: {community_path}")
+    print(f"Expected coef cache: {coef_path}")
 
     if args.grid_search:
         lrs, batch_sizes, embedding_dims = dataset_default_grid(args)
     else:
         lrs, batch_sizes, embedding_dims = [args.lr], [args.batch_size], [args.embedding_dim]
 
+    ave_results = []
     for lr in lrs:
         for batch_size in batch_sizes:
             for embedding_dim in embedding_dims:
-                args.lr = lr
-                args.batch_size = batch_size
-                args.embedding_dim = embedding_dim
+                cur_args = copy(args)
+                cur_args.lr = lr
+                cur_args.batch_size = batch_size
+                cur_args.embedding_dim = embedding_dim
+
                 print("\n==============================")
-                print(f"lr={args.lr}, batch_size={args.batch_size}, embedding_dim={args.embedding_dim}")
-                ano_label, ano_score_final = train_ours(args)
+                print(
+                    f"lr={cur_args.lr}, batch_size={cur_args.batch_size}, "
+                    f"embedding_dim={cur_args.embedding_dim}"
+                )
+                ano_label, ano_score_final = train_ours(cur_args)
                 k = int(np.sum(ano_label))
                 auc, ap, recall = get_scores(ano_label, ano_score_final, k)
                 print(f"AUC={auc:.4f}, AUPRC={ap:.4f}, Recall@K={recall:.4f}")

@@ -3,9 +3,10 @@ import os
 import pickle
 import random
 import re
+import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -18,10 +19,53 @@ from sklearn.metrics.pairwise import cosine_similarity
 from torch_geometric.data import Data
 from torch_geometric.utils import remove_isolated_nodes
 
-
 MAT_ADJ_KEYS = ("Network", "network", "A", "adj", "Adj", "adjacency", "edges")
 MAT_FEAT_KEYS = ("Attributes", "attributes", "X", "x", "features", "Features", "attrb", "attr")
 MAT_LABEL_KEYS = ("Label", "label", "labels", "y", "Y", "gnd", "Class", "class")
+
+# In-process caches reduce repeated disk IO during grid search / repeated train_ours calls.
+_DATA_CACHE: Dict[Tuple[str, str, float], Data] = {}
+_PREPROCESS_CACHE: Dict[Tuple[str, str, str, int, int, float, float], Tuple[List[int], np.ndarray, Path, Path]] = {}
+
+
+def _expand_path(path_like) -> Path:
+    return Path(os.path.expanduser(str(path_like))).resolve()
+
+
+def resolve_preprocess_paths(args) -> Tuple[Path, Path, Path]:
+    """Resolve preprocess cache location.
+
+    Default behavior changed from:
+        <data_dir>/cgad_preprocess/<dataset>.json|pkl
+    to:
+        <train_dir>/cgad_preprocess/<dataset>.json|pkl
+
+    --cache_dir remains available for explicitly overriding the location.
+    """
+    if getattr(args, "cache_dir", None):
+        cache_dir = _expand_path(args.cache_dir)
+    else:
+        train_dir = _expand_path(getattr(args, "train_dir", "./runs"))
+        cache_dir = train_dir / "cgad_preprocess"
+    community_path = cache_dir / f"{args.dataset}.json"
+    coef_path = cache_dir / f"{args.dataset}.pkl"
+    return cache_dir, community_path, coef_path
+
+
+def _atomic_json_dump(obj, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf8", dir=path.parent, delete=False) as f:
+        json.dump(obj, f, ensure_ascii=False)
+        tmp_name = f.name
+    os.replace(tmp_name, path)
+
+
+def _atomic_pickle_dump(obj, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_name = f.name
+    os.replace(tmp_name, path)
 
 
 def _first_existing_key(mat: Dict, keys: Sequence[str]):
@@ -71,6 +115,7 @@ def _as_label_array(value, num_nodes: int) -> np.ndarray:
     value = value.astype(np.int64)
     if value.shape[0] != num_nodes:
         raise ValueError(f"Label length {value.shape[0]} does not match num_nodes {num_nodes}.")
+
     # Some binary anomaly datasets use {-1, 1}; make them {0, 1}.
     uniq = set(np.unique(value).tolist())
     if uniq.issubset({-1, 1}):
@@ -86,16 +131,20 @@ def load_mat_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
     - feature: Attributes/X/features/attrb
     - label: Label/y/gnd/Class
     """
-    data_dir = Path(os.path.expanduser(data_dir))
+    data_dir = _expand_path(data_dir)
     mat_path = data_dir / f"{dataset}.mat"
     if not mat_path.exists():
         raise FileNotFoundError(f"Cannot find dataset file: {mat_path}")
+
+    mtime = mat_path.stat().st_mtime
+    cache_key = (dataset, str(data_dir), mtime)
+    if cache_key in _DATA_CACHE:
+        return _DATA_CACHE[cache_key]
 
     mat = sio.loadmat(mat_path)
     adj_key = _first_existing_key(mat, MAT_ADJ_KEYS)
     feat_key = _first_existing_key(mat, MAT_FEAT_KEYS)
     label_key = _first_existing_key(mat, MAT_LABEL_KEYS)
-
     if adj_key is None:
         raise KeyError(f"No adjacency key found in {mat_path}. Tried: {MAT_ADJ_KEYS}")
     if feat_key is None:
@@ -110,15 +159,12 @@ def load_mat_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
 
     x = _as_dense_float_array(mat[feat_key])
     y = _as_label_array(mat[label_key], adj.shape[0])
-
     if x.shape[0] != adj.shape[0]:
         # Some .mat files store attributes transposed.
         if x.shape[1] == adj.shape[0]:
             x = x.T
         else:
-            raise ValueError(
-                f"Feature shape {x.shape} does not match adjacency shape {adj.shape}."
-            )
+            raise ValueError(f"Feature shape {x.shape} does not match adjacency shape {adj.shape}.")
 
     row, col = adj.nonzero()
     edge_index = torch.as_tensor(np.vstack([row, col]), dtype=torch.long)
@@ -128,42 +174,45 @@ def load_mat_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
         y=torch.as_tensor(y, dtype=torch.long),
     )
     data.num_nodes = int(adj.shape[0])
+    _DATA_CACHE[cache_key] = data
     return data
 
 
 def preprocess_features(features):
-    """Row-normalize feature matrix and return dense matrix."""
-    rowsum = np.array(features.sum(1))
-    r_inv = np.power(rowsum, -1).flatten()
+    """Row-normalize feature matrix and return dense float32 matrix."""
+    rowsum = np.array(features.sum(1), dtype=np.float32)
+    r_inv = np.power(rowsum, -1, where=rowsum != 0).flatten()
     r_inv[np.isinf(r_inv)] = 0.0
+    r_inv[np.isnan(r_inv)] = 0.0
     r_mat_inv = sp.diags(r_inv)
     features = r_mat_inv.dot(features)
-    return features.todense()
+    return np.asarray(features.todense(), dtype=np.float32)
 
 
 def normalize_adj(adj):
     """Symmetrically normalize adjacency matrix."""
-    adj = sp.coo_matrix(adj)
-    rowsum = np.array(adj.sum(1))
-    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+    adj = sp.coo_matrix(adj, dtype=np.float32)
+    rowsum = np.array(adj.sum(1), dtype=np.float32)
+    d_inv_sqrt = np.power(rowsum, -0.5, where=rowsum != 0).flatten()
     d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
+    d_inv_sqrt[np.isnan(d_inv_sqrt)] = 0.0
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
 
 
 def build_neighbor_lists(edge_index: torch.Tensor, num_nodes: int, undirected: bool = True) -> List[List[int]]:
-    """Build CPU adjacency lists from PyG edge_index."""
-    edge_index = edge_index.detach().cpu().long()
+    """Build CPU adjacency lists from PyG edge_index once and reuse them."""
+    edge_np = edge_index.detach().cpu().long().numpy()
     neighbors = [set() for _ in range(num_nodes)]
-    rows = edge_index[0].tolist()
-    cols = edge_index[1].tolist()
-    for src, dst in zip(rows, cols):
+    for src, dst in zip(edge_np[0], edge_np[1]):
+        src = int(src)
+        dst = int(dst)
         if src == dst:
             continue
         neighbors[src].add(dst)
         if undirected:
             neighbors[dst].add(src)
-    return [sorted(list(item)) for item in neighbors]
+    return [sorted(item) for item in neighbors]
 
 
 def _rwr_unique_trace(seed: int, neighbors: List[List[int]], restart_prob: float, max_steps: int) -> List[int]:
@@ -175,7 +224,8 @@ def _rwr_unique_trace(seed: int, neighbors: List[List[int]], restart_prob: float
         else:
             cur = random.choice(neighbors[cur])
         trace.append(cur)
-    # preserve order while removing duplicates
+
+    # Preserve order while removing duplicates.
     seen = set()
     unique = []
     for node in trace:
@@ -186,10 +236,10 @@ def _rwr_unique_trace(seed: int, neighbors: List[List[int]], restart_prob: float
 
 
 def generate_rwr_subgraph(edge_index_or_neighbors, subgraph_size: int, num_nodes: int = None):
-    """Generate RWR subgraphs using PyG edge_index instead of DGL.
+    """Generate RWR subgraphs using PyG edge_index / cached neighbor lists instead of DGL.
 
-    The returned subgraph keeps the original CGAD convention:
-    the target node is placed at the final position of each subgraph.
+    The returned subgraph keeps the original CGAD convention: the target node is
+    placed at the final position of each subgraph.
     """
     if isinstance(edge_index_or_neighbors, torch.Tensor):
         if num_nodes is None:
@@ -235,11 +285,13 @@ def generate_coef(features: np.ndarray) -> np.ndarray:
     """Generate feature cosine-similarity matrix used by CGAD sample selection."""
     if sp.issparse(features):
         features = features.toarray()
-    return cosine_similarity(np.asarray(features, dtype=np.float32))
+    features = np.asarray(features, dtype=np.float32)
+    coef = cosine_similarity(features)
+    return np.asarray(coef, dtype=np.float32)
 
 
 def _largest_remainder_partition(nodecom: List[int], max_communities: int) -> List[int]:
-    """Merge tiny surplus communities into [0, max_communities-1] ids."""
+    """Merge surplus communities into [0, max_communities - 1] ids."""
     if max_communities <= 0:
         return nodecom
     uniq = sorted(set(nodecom))
@@ -256,19 +308,23 @@ def _largest_remainder_partition(nodecom: List[int], max_communities: int) -> Li
         if cid in keep_set:
             merged.append(remap[cid])
         else:
-            # Assign remaining communities to the nearest-size bucket deterministically.
+            # Assign remaining communities deterministically.
             merged.append(idx % max_communities)
     return merged
 
 
-def generate_community(edge_index: torch.Tensor, num_nodes: int, method: str = "louvain", seed: int = 1,
-                       max_communities: int = 0) -> List[int]:
+def generate_community(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    method: str = "louvain",
+    seed: int = 1,
+    max_communities: int = 0,
+) -> List[int]:
     """Generate community id for every node, replacing the original external json."""
     graph = nx.Graph()
     graph.add_nodes_from(range(num_nodes))
     graph.add_edges_from(edge_index.detach().cpu().long().t().tolist())
 
-    communities = None
     if method == "louvain" and hasattr(nx.community, "louvain_communities"):
         communities = nx.community.louvain_communities(graph, seed=seed)
     elif method == "greedy":
@@ -294,34 +350,62 @@ def generate_community(edge_index: torch.Tensor, num_nodes: int, method: str = "
 
 
 def load_or_generate_preprocess(data: Data, args):
-    """Load cached community/coef if available, otherwise generate them automatically."""
-    cache_dir = Path(os.path.expanduser(args.cache_dir))
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    community_path = cache_dir / f"{args.dataset}.json"
-    coef_path = cache_dir / f"{args.dataset}.pkl"
+    """Load cached community/coef if available, otherwise generate them automatically.
 
-    if args.force_preprocess or not community_path.exists():
+    Cache is kept in memory after the first load/generation, so grid search does not
+    repeatedly read the same .json/.pkl files from disk.
+    """
+    cache_dir, community_path, coef_path = resolve_preprocess_paths(args)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    community_mtime = community_path.stat().st_mtime if community_path.exists() else -1.0
+    coef_mtime = coef_path.stat().st_mtime if coef_path.exists() else -1.0
+    cache_key = (
+        args.dataset,
+        str(cache_dir),
+        getattr(args, "community_method", "louvain"),
+        int(getattr(args, "max_communities", 0)),
+        int(getattr(args, "seed", 1)),
+        community_mtime,
+        coef_mtime,
+    )
+    if not getattr(args, "force_preprocess", False) and cache_key in _PREPROCESS_CACHE:
+        return _PREPROCESS_CACHE[cache_key]
+
+    if getattr(args, "force_preprocess", False) or not community_path.exists():
         nodecom = generate_community(
             data.edge_index,
             data.num_nodes,
-            method=args.community_method,
-            seed=args.seed,
-            max_communities=args.max_communities,
+            method=getattr(args, "community_method", "louvain"),
+            seed=getattr(args, "seed", 1),
+            max_communities=getattr(args, "max_communities", 0),
         )
-        with open(community_path, "w", encoding="utf8") as f:
-            json.dump({"com": nodecom}, f)
+        _atomic_json_dump({"com": nodecom}, community_path)
     else:
         with open(community_path, encoding="utf8") as f:
             nodecom = json.load(f)["com"]
 
-    if args.force_preprocess or not coef_path.exists():
+    if getattr(args, "force_preprocess", False) or not coef_path.exists():
         coef = generate_coef(data.x.detach().cpu().numpy())
-        with open(coef_path, "wb") as f:
-            pickle.dump(coef, f, protocol=pickle.HIGHEST_PROTOCOL)
+        _atomic_pickle_dump(coef, coef_path)
     else:
         with open(coef_path, "rb") as f:
             coef = pickle.load(f)
+        coef = np.asarray(coef, dtype=np.float32)
 
+    # Refresh mtime after possible generation.
+    community_mtime = community_path.stat().st_mtime if community_path.exists() else -1.0
+    coef_mtime = coef_path.stat().st_mtime if coef_path.exists() else -1.0
+    cache_key = (
+        args.dataset,
+        str(cache_dir),
+        getattr(args, "community_method", "louvain"),
+        int(getattr(args, "max_communities", 0)),
+        int(getattr(args, "seed", 1)),
+        community_mtime,
+        coef_mtime,
+    )
+    _PREPROCESS_CACHE[cache_key] = (nodecom, coef, community_path, coef_path)
     return nodecom, coef, community_path, coef_path
 
 
@@ -356,12 +440,16 @@ def get_one_sample(subgraph_size, nb_nodes, coef, subgraphs, strategy):
             coefs = [coef[nd][neb] for neb in neighbors]
             chosen = neighbors[int(np.argmax(coefs))]
         all_samples.append(subgraphs[nd].index(chosen))
-    return np.asarray(all_samples)
+    return np.asarray(all_samples, dtype=np.int64)
 
 
 def RemoveIsolated(data):
     num_nodes = data.num_nodes
-    edge_index, edge_attr, mask = remove_isolated_nodes(data.edge_index, getattr(data, "edge_attr", None), num_nodes)
+    edge_index, edge_attr, mask = remove_isolated_nodes(
+        data.edge_index,
+        getattr(data, "edge_attr", None),
+        num_nodes,
+    )
     data.edge_index = edge_index
     data.edge_attr = edge_attr
     for key, item in list(data):
@@ -405,16 +493,15 @@ def get_negs(idx, nodecom, communities, Com_size_ratio, num_negs, neg_sample_met
 
         if neg_sample_method == "bias":
             weights = []
+            original_candidates = [c for c in communities if c != nd_com]
             for com in candidate_coms:
-                original_candidates = [c for c in communities if c != nd_com]
                 pos = original_candidates.index(com)
                 weights.append(Com_size_ratio[nd_com][pos])
         else:  # even
             weights = [1.0] * len(candidate_coms)
 
         selected_coms = random.choices(candidate_coms, weights=weights, k=num_negs)
-        selected = []
-        for com in selected_coms:
-            selected.append(random.choice(com_to_pos[com]))
+        selected = [random.choice(com_to_pos[com]) for com in selected_coms]
         negs.append(selected)
+
     return np.asarray(negs, dtype=np.int64).T
