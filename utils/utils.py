@@ -14,7 +14,8 @@ import scipy.io as sio
 import scipy.sparse as sp
 import torch
 from scipy.sparse import issparse
-from sklearn import metrics
+from sklearn.metrics import auc as sk_auc
+from sklearn.metrics import precision_recall_curve, roc_auc_score
 from sklearn.metrics.pairwise import cosine_similarity
 from torch_geometric.data import Data
 from torch_geometric.utils import remove_isolated_nodes
@@ -35,12 +36,10 @@ def _expand_path(path_like) -> Path:
 def resolve_preprocess_paths(args) -> Tuple[Path, Path, Path]:
     """Resolve preprocess cache location.
 
-    Default behavior changed from:
-        <data_dir>/cgad_preprocess/<dataset>.json|pkl
-    to:
-        <train_dir>/cgad_preprocess/<dataset>.json|pkl
-
-    --cache_dir remains available for explicitly overriding the location.
+    If --cache_dir is not explicitly set, generated files are placed under
+    <train_dir>/cgad_preprocess instead of the dataset directory:
+        <train_dir>/cgad_preprocess/<dataset>.json
+        <train_dir>/cgad_preprocess/<dataset>.pkl
     """
     if getattr(args, "cache_dir", None):
         cache_dir = _expand_path(args.cache_dir)
@@ -115,7 +114,6 @@ def _as_label_array(value, num_nodes: int) -> np.ndarray:
     value = value.astype(np.int64)
     if value.shape[0] != num_nodes:
         raise ValueError(f"Label length {value.shape[0]} does not match num_nodes {num_nodes}.")
-
     # Some binary anomaly datasets use {-1, 1}; make them {0, 1}.
     uniq = set(np.unique(value).tolist())
     if uniq.issubset({-1, 1}):
@@ -181,7 +179,9 @@ def load_mat_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
 def preprocess_features(features):
     """Row-normalize feature matrix and return dense float32 matrix."""
     rowsum = np.array(features.sum(1), dtype=np.float32)
-    r_inv = np.power(rowsum, -1, where=rowsum != 0).flatten()
+    r_inv = np.zeros_like(rowsum, dtype=np.float32).flatten()
+    nz = rowsum.flatten() != 0
+    r_inv[nz] = 1.0 / rowsum.flatten()[nz]
     r_inv[np.isinf(r_inv)] = 0.0
     r_inv[np.isnan(r_inv)] = 0.0
     r_mat_inv = sp.diags(r_inv)
@@ -192,8 +192,10 @@ def preprocess_features(features):
 def normalize_adj(adj):
     """Symmetrically normalize adjacency matrix."""
     adj = sp.coo_matrix(adj, dtype=np.float32)
-    rowsum = np.array(adj.sum(1), dtype=np.float32)
-    d_inv_sqrt = np.power(rowsum, -0.5, where=rowsum != 0).flatten()
+    rowsum = np.array(adj.sum(1), dtype=np.float32).flatten()
+    d_inv_sqrt = np.zeros_like(rowsum, dtype=np.float32)
+    nz = rowsum != 0
+    d_inv_sqrt[nz] = np.power(rowsum[nz], -0.5)
     d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
     d_inv_sqrt[np.isnan(d_inv_sqrt)] = 0.0
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
@@ -342,7 +344,6 @@ def generate_community(
     for cid, nodes in enumerate(communities):
         for node in nodes:
             nodecom[int(node)] = int(cid)
-
     nodecom = _largest_remainder_partition(nodecom, max_communities)
     uniq = sorted(set(nodecom))
     remap = {cid: i for i, cid in enumerate(uniq)}
@@ -352,8 +353,8 @@ def generate_community(
 def load_or_generate_preprocess(data: Data, args):
     """Load cached community/coef if available, otherwise generate them automatically.
 
-    Cache is kept in memory after the first load/generation, so grid search does not
-    repeatedly read the same .json/.pkl files from disk.
+    Cache is kept in memory after the first load/generation, so grid search does
+    not repeatedly read the same .json/.pkl files from disk.
     """
     cache_dir, community_path, coef_path = resolve_preprocess_paths(args)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -391,7 +392,7 @@ def load_or_generate_preprocess(data: Data, args):
     else:
         with open(coef_path, "rb") as f:
             coef = pickle.load(f)
-        coef = np.asarray(coef, dtype=np.float32)
+    coef = np.asarray(coef, dtype=np.float32)
 
     # Refresh mtime after possible generation.
     community_mtime = community_path.stat().st_mtime if community_path.exists() else -1.0
@@ -410,16 +411,35 @@ def load_or_generate_preprocess(data: Data, args):
 
 
 def get_scores(actual, score, k=None):
-    actual = np.asarray(actual).astype(int)
-    score = np.asarray(score)
-    auc = metrics.roc_auc_score(actual, score)
-    ap = metrics.average_precision_score(actual, score)
+    """Return ROC-AUC, PR-AUC and Recall@K.
+
+    AUPRC is intentionally computed by scikit-learn's
+    precision_recall_curve + auc, rather than average_precision_score.
+    """
+    actual = np.asarray(actual).astype(int).reshape(-1)
+    score = np.asarray(score, dtype=float).reshape(-1)
+    if actual.shape[0] != score.shape[0]:
+        raise ValueError(f"actual length {actual.shape[0]} != score length {score.shape[0]}")
+
+    positives = int(actual.sum())
+    has_two_classes = len(np.unique(actual)) == 2
+    auc_value = float(roc_auc_score(actual, score)) if has_two_classes else float("nan")
+
+    if positives > 0:
+        precision, recall, _ = precision_recall_curve(actual, score)
+        auprc_value = float(sk_auc(recall, precision))
+    else:
+        auprc_value = float("nan")
+
     if k is None:
-        k = int(actual.sum())
+        k = positives
     k = max(int(k), 1)
-    order = np.argsort(-score)[:k]
-    rec = float(actual[order].sum() / max(actual.sum(), 1))
-    return auc, ap, rec
+    if positives > 0:
+        order = np.argsort(-score)[:k]
+        rec = float(actual[order].sum() / positives)
+    else:
+        rec = float("nan")
+    return auc_value, auprc_value, rec
 
 
 def get_one_sample(subgraph_size, nb_nodes, coef, subgraphs, strategy):
@@ -503,5 +523,4 @@ def get_negs(idx, nodecom, communities, Com_size_ratio, num_negs, neg_sample_met
         selected_coms = random.choices(candidate_coms, weights=weights, k=num_negs)
         selected = [random.choice(com_to_pos[com]) for com in selected_coms]
         negs.append(selected)
-
     return np.asarray(negs, dtype=np.int64).T

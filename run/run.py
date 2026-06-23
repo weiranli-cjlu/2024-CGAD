@@ -74,10 +74,7 @@ def _iter_community_batches(comnode: List[List[int]], batch_num: int):
                 for j in range(len(comnode))
             ]
         else:
-            idx_nested = [
-                comnode[j][batch_idx * com_batch_sizes[j] :]
-                for j in range(len(comnode))
-            ]
+            idx_nested = [comnode[j][batch_idx * com_batch_sizes[j] :] for j in range(len(comnode))]
         idx = sum(idx_nested, [])
         if idx:
             yield batch_idx, is_final_batch, idx
@@ -99,10 +96,8 @@ def _build_batch_tensors(
     device = features_base.device
     idx_tensor = torch.as_tensor(idx, dtype=torch.long, device=device)
     nodes = subgraph_tensor.index_select(0, idx_tensor)  # [B, S]
-
     bf = features_base[nodes]  # [B, S, F]
     ba = adj_base[nodes.unsqueeze(2), nodes.unsqueeze(1)]  # [B, S, S]
-
     bf_mask = bf.clone()
     bf_mask[:, -1, :] = 0.0
     ba_mask = mask_adj_base.expand(len(idx), -1, -1)
@@ -117,7 +112,11 @@ def _prepare_epoch_subgraphs(neighbor_lists, subgraph_size, nb_nodes, coef, stra
 
 
 def train_ours(args):
-    print(f"Dataset: {args.dataset}", flush=True)
+    """Train CGAD and return anomaly labels/scores.
+
+    Printing inside the training and testing loops is intentionally removed.
+    main.py prints only the final summary and appends the CSV result row.
+    """
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -126,9 +125,7 @@ def train_ours(args):
     if data.has_isolated_nodes():
         data = RemoveIsolated(data)
 
-    nodecom, coef, community_path, coef_path = load_or_generate_preprocess(data, args)
-    print(f"Community cache: {community_path}", flush=True)
-    print(f"Coef cache: {coef_path}", flush=True)
+    nodecom, coef, _, _ = load_or_generate_preprocess(data, args)
 
     adj = to_scipy_sparse_matrix(data.edge_index, num_nodes=data.num_nodes).tocsr()
     features_sp = sp.lil_matrix(data.x.detach().cpu().numpy())
@@ -141,7 +138,6 @@ def train_ours(args):
 
     adj_norm = normalize_adj(adj)
     adj_dense = (adj_norm + sp.eye(adj_norm.shape[0], dtype=np.float32)).toarray().astype(np.float32)
-
     features_base = torch.as_tensor(features, dtype=torch.float32, device=device)
     adj_base = torch.as_tensor(adj_dense, dtype=torch.float32, device=device)
     mask_adj_base = torch.eye(args.subgraph_size, device=device)
@@ -151,10 +147,10 @@ def train_ours(args):
 
     communities, com_size_ratio, comnode = _build_community_helpers(nodecom, nb_nodes)
     if len(communities) < 2 and args.neg_sample_method != "random":
-        print("Only one community generated; fallback neg_sample_method to random.", flush=True)
         args.neg_sample_method = "random"
 
     final_scores = []
+    run_infos = []
     seeds = [args.seed + i for i in range(args.runs)]
     batch_size = args.batch_size
     subgraph_size = args.subgraph_size
@@ -163,7 +159,6 @@ def train_ours(args):
     for run in range(args.runs):
         seed = seeds[run]
         set_seed(seed)
-        print(f"---Train run {run + 1}/{args.runs}, seed={seed}---", flush=True)
 
         model = Model(ft_size, args.embedding_dim, "prelu", args.readout, args.T).to(device)
         optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -171,11 +166,13 @@ def train_ours(args):
         cnt_wait = 0
         best = float("inf")
         best_t = 0
+        epochs_trained = 0
 
         for epoch in range(args.num_epoch):
             model.train()
             total_loss = 0.0
             total_seen = 0
+            epochs_trained = epoch + 1
 
             subgraph_tensor, all_samples = _prepare_epoch_subgraphs(
                 neighbor_lists, subgraph_size, nb_nodes, coef, args.strategy, device
@@ -184,8 +181,8 @@ def train_ours(args):
             for _, _, idx in _iter_community_batches(comnode, batch_num):
                 random.shuffle(idx)
                 cur_batch_size = len(idx)
-
                 optimiser.zero_grad(set_to_none=True)
+
                 multi_neg_node = get_negs(
                     idx,
                     nodecom,
@@ -202,8 +199,8 @@ def train_ours(args):
                     idx,
                     mask_adj_base,
                 )
-
                 sample_node = all_samples[idx]
+
                 node_logits, sub_logits, _ = model(
                     bf_mask,
                     ba,
@@ -212,9 +209,11 @@ def train_ours(args):
                     multi_neg_node,
                     sample_node,
                 )
+
                 node_loss = Rnce_loss(node_logits, lam=args.lam, q=args.q)
                 sub_loss = Rnce_loss(sub_logits, lam=args.lam, q=args.q)
                 loss = args.alpha * node_loss + (1 - args.alpha) * sub_loss
+
                 loss.backward()
                 optimiser.step()
 
@@ -230,12 +229,9 @@ def train_ours(args):
             else:
                 cnt_wait += 1
 
-            print(f"Epoch:{epoch} Loss:{mean_loss:.8f}", flush=True)
             if cnt_wait == args.patience:
-                print(f"Early stopping at epoch {epoch}; best epoch {best_t}", flush=True)
                 break
 
-        print(f"---Test run {run + 1}/{args.runs}---", flush=True)
         model.eval()
         multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes), dtype=np.float32)
 
@@ -245,7 +241,6 @@ def train_ours(args):
             )
 
             for _, _, idx in _iter_community_batches(comnode, batch_num):
-                cur_batch_size = len(idx)
                 multi_neg_node = get_negs(
                     idx,
                     nodecom,
@@ -273,9 +268,9 @@ def train_ours(args):
                         multi_neg_node,
                         sample_node,
                     )
+
                     node_logits_np = node_logits.detach().cpu().numpy()
                     sub_logits_np = sub_logits.detach().cpu().numpy()
-
                     node_score = node_logits_np[:, 1:] - node_logits_np[:, [0]]
                     node_score = np.mean(node_score, axis=1) + np.std(node_score, axis=1)
                     sub_score = sub_logits_np[:, 1:] - sub_logits_np[:, [0]]
@@ -286,6 +281,17 @@ def train_ours(args):
         ano_score_final = np.mean(multi_round_ano_score, axis=0) + np.std(multi_round_ano_score, axis=0)
         ano_score_final = ano_score_final - np.min(ano_score_final)
         final_scores.append(ano_score_final)
+        run_infos.append(
+            {
+                "run": run + 1,
+                "seed": seed,
+                "epochs_trained": epochs_trained,
+                "best_epoch": best_t,
+                "best_loss": best,
+            }
+        )
 
-    ano_score_final = np.mean(np.vstack(final_scores), axis=0)
-    return ano_label, ano_score_final
+    ano_score_mean = np.mean(np.vstack(final_scores), axis=0)
+    if getattr(args, "return_run_scores", False):
+        return ano_label, ano_score_mean, final_scores, run_infos
+    return ano_label, ano_score_mean
