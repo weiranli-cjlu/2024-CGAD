@@ -1,343 +1,420 @@
-"""Utility functions for CGAD without DGL.
-
-This module replaces ``dgl.contrib.sampling.random_walk_with_restart`` with a
-PyG edge_index based random-walk-with-restart sampler. The sampler runs on CPU
-because subgraph sampling is stochastic control logic and does not benefit much
-from moving many small random choices to GPU. Training tensors are still moved to
-``args.device``.
-"""
-
-from __future__ import annotations
-
-import heapq
+import json
+import os
+import pickle
 import random
 import re
-from collections import defaultdict
-from typing import Dict, Iterable, List, Mapping, MutableSequence, Sequence
+from collections import Counter
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
 
+import networkx as nx
 import numpy as np
+import scipy.io as sio
 import scipy.sparse as sp
 import torch
-from sklearn.metrics import average_precision_score, roc_auc_score
-from torch_geometric.utils import remove_isolated_nodes, to_undirected
+from scipy.sparse import issparse
+from sklearn import metrics
+from sklearn.metrics.pairwise import cosine_similarity
+from torch_geometric.data import Data
+from torch_geometric.utils import remove_isolated_nodes
 
 
-def preprocess_features(features: sp.spmatrix) -> np.matrix:
-    """Row-normalize a scipy sparse feature matrix."""
-    rowsum = np.asarray(features.sum(1)).reshape(-1)
-    r_inv = np.zeros_like(rowsum, dtype=float)
-    nonzero = rowsum != 0
-    r_inv[nonzero] = np.power(rowsum[nonzero], -1)
-    r_inv[~np.isfinite(r_inv)] = 0.0
+MAT_ADJ_KEYS = ("Network", "network", "A", "adj", "Adj", "adjacency", "edges")
+MAT_FEAT_KEYS = ("Attributes", "attributes", "X", "x", "features", "Features", "attrb", "attr")
+MAT_LABEL_KEYS = ("Label", "label", "labels", "y", "Y", "gnd", "Class", "class")
+
+
+def _first_existing_key(mat: Dict, keys: Sequence[str]):
+    for key in keys:
+        if key in mat:
+            return key
+    return None
+
+
+def _to_numpy_or_sparse(value):
+    if issparse(value):
+        return value
+    arr = np.asarray(value)
+    if arr.dtype == object and arr.size == 1:
+        arr = np.asarray(arr.item())
+    return arr
+
+
+def _as_csr_matrix(value) -> sp.csr_matrix:
+    value = _to_numpy_or_sparse(value)
+    if issparse(value):
+        return value.tocsr()
+    return sp.csr_matrix(np.asarray(value))
+
+
+def _as_dense_float_array(value) -> np.ndarray:
+    value = _to_numpy_or_sparse(value)
+    if issparse(value):
+        value = value.toarray()
+    value = np.asarray(value, dtype=np.float32)
+    if value.ndim == 1:
+        value = value.reshape(-1, 1)
+    return value
+
+
+def _as_label_array(value, num_nodes: int) -> np.ndarray:
+    value = _to_numpy_or_sparse(value)
+    if issparse(value):
+        value = value.toarray()
+    value = np.asarray(value).squeeze()
+    if value.ndim > 1:
+        # For one-hot labels, use the positive/anomaly column if possible.
+        if value.shape[0] == num_nodes:
+            value = np.argmax(value, axis=1)
+        else:
+            value = value.reshape(-1)
+    value = value.astype(np.int64)
+    if value.shape[0] != num_nodes:
+        raise ValueError(f"Label length {value.shape[0]} does not match num_nodes {num_nodes}.")
+    # Some binary anomaly datasets use {-1, 1}; make them {0, 1}.
+    uniq = set(np.unique(value).tolist())
+    if uniq.issubset({-1, 1}):
+        value = (value > 0).astype(np.int64)
+    return value
+
+
+def load_mat_data(dataset: str, data_dir: str = "~/datasets/GAD/mat") -> Data:
+    """Load common GAD .mat datasets as a PyG Data object.
+
+    Supported key aliases:
+    - adjacency: Network/A/adj/adjacency
+    - feature: Attributes/X/features/attrb
+    - label: Label/y/gnd/Class
+    """
+    data_dir = Path(os.path.expanduser(data_dir))
+    mat_path = data_dir / f"{dataset}.mat"
+    if not mat_path.exists():
+        raise FileNotFoundError(f"Cannot find dataset file: {mat_path}")
+
+    mat = sio.loadmat(mat_path)
+    adj_key = _first_existing_key(mat, MAT_ADJ_KEYS)
+    feat_key = _first_existing_key(mat, MAT_FEAT_KEYS)
+    label_key = _first_existing_key(mat, MAT_LABEL_KEYS)
+
+    if adj_key is None:
+        raise KeyError(f"No adjacency key found in {mat_path}. Tried: {MAT_ADJ_KEYS}")
+    if feat_key is None:
+        raise KeyError(f"No feature key found in {mat_path}. Tried: {MAT_FEAT_KEYS}")
+    if label_key is None:
+        raise KeyError(f"No label key found in {mat_path}. Tried: {MAT_LABEL_KEYS}")
+
+    adj = _as_csr_matrix(mat[adj_key])
+    adj = adj.maximum(adj.T)
+    adj.setdiag(0)
+    adj.eliminate_zeros()
+
+    x = _as_dense_float_array(mat[feat_key])
+    y = _as_label_array(mat[label_key], adj.shape[0])
+
+    if x.shape[0] != adj.shape[0]:
+        # Some .mat files store attributes transposed.
+        if x.shape[1] == adj.shape[0]:
+            x = x.T
+        else:
+            raise ValueError(
+                f"Feature shape {x.shape} does not match adjacency shape {adj.shape}."
+            )
+
+    row, col = adj.nonzero()
+    edge_index = torch.as_tensor(np.vstack([row, col]), dtype=torch.long)
+    data = Data(
+        x=torch.as_tensor(x, dtype=torch.float32),
+        edge_index=edge_index,
+        y=torch.as_tensor(y, dtype=torch.long),
+    )
+    data.num_nodes = int(adj.shape[0])
+    return data
+
+
+def preprocess_features(features):
+    """Row-normalize feature matrix and return dense matrix."""
+    rowsum = np.array(features.sum(1))
+    r_inv = np.power(rowsum, -1).flatten()
+    r_inv[np.isinf(r_inv)] = 0.0
     r_mat_inv = sp.diags(r_inv)
-    return r_mat_inv.dot(features).todense()
+    features = r_mat_inv.dot(features)
+    return features.todense()
 
 
-def normalize_adj(adj: sp.spmatrix) -> sp.coo_matrix:
-    """Symmetrically normalize adjacency matrix: D^{-1/2} A D^{-1/2}."""
+def normalize_adj(adj):
+    """Symmetrically normalize adjacency matrix."""
     adj = sp.coo_matrix(adj)
-    rowsum = np.asarray(adj.sum(1)).reshape(-1)
-    d_inv_sqrt = np.zeros_like(rowsum, dtype=float)
-    nonzero = rowsum != 0
-    d_inv_sqrt[nonzero] = np.power(rowsum[nonzero], -0.5)
-    d_inv_sqrt[~np.isfinite(d_inv_sqrt)] = 0.0
+    rowsum = np.array(adj.sum(1))
+    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
 
 
-def build_neighbor_lists(
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    *,
-    undirected: bool = True,
-) -> List[List[int]]:
-    """Build CPU adjacency lists from a PyG ``edge_index`` tensor.
-
-    Parameters
-    ----------
-    edge_index:
-        PyG COO graph connectivity with shape [2, num_edges].
-    num_nodes:
-        Number of nodes in the graph.
-    undirected:
-        Whether to symmetrize the graph before random walks. The original CGAD
-        code converted scipy adjacency to a NetworkX graph and then a DGLGraph;
-        for common attributed-network datasets this behaves as an undirected
-        neighborhood sampler. Keeping this default improves compatibility.
-    """
-    if edge_index.numel() == 0:
-        return [[] for _ in range(num_nodes)]
-
+def build_neighbor_lists(edge_index: torch.Tensor, num_nodes: int, undirected: bool = True) -> List[List[int]]:
+    """Build CPU adjacency lists from PyG edge_index."""
     edge_index = edge_index.detach().cpu().long()
-    if undirected:
-        edge_index = to_undirected(edge_index, num_nodes=num_nodes)
-
-    neighbors: List[List[int]] = [[] for _ in range(num_nodes)]
-    src, dst = edge_index.tolist()
-    for u, v in zip(src, dst):
-        if 0 <= u < num_nodes and 0 <= v < num_nodes and u != v:
-            neighbors[u].append(v)
-
-    # De-duplicate while preserving deterministic order under a fixed edge_index.
-    for node in range(num_nodes):
-        if len(neighbors[node]) > 1:
-            neighbors[node] = list(dict.fromkeys(neighbors[node]))
-    return neighbors
+    neighbors = [set() for _ in range(num_nodes)]
+    rows = edge_index[0].tolist()
+    cols = edge_index[1].tolist()
+    for src, dst in zip(rows, cols):
+        if src == dst:
+            continue
+        neighbors[src].add(dst)
+        if undirected:
+            neighbors[dst].add(src)
+    return [sorted(list(item)) for item in neighbors]
 
 
-def _fallback_expand(
-    seed: int,
-    neighbors: Sequence[Sequence[int]],
-    selected: MutableSequence[int],
-    selected_set: set[int],
-    target_size: int,
-) -> None:
-    """Fill a subgraph with 1-hop/2-hop neighbors if RWR under-samples."""
-    for hop1 in neighbors[seed]:
-        if hop1 != seed and hop1 not in selected_set:
-            selected.append(hop1)
-            selected_set.add(hop1)
-            if len(selected) >= target_size:
-                return
-
-    for hop1 in neighbors[seed]:
-        for hop2 in neighbors[hop1]:
-            if hop2 != seed and hop2 not in selected_set:
-                selected.append(hop2)
-                selected_set.add(hop2)
-                if len(selected) >= target_size:
-                    return
-
-
-def _single_rwr_subgraph(
-    seed: int,
-    neighbors: Sequence[Sequence[int]],
-    subgraph_size: int,
-    restart_prob: float,
-    max_steps: int,
-) -> List[int]:
-    """Sample one fixed-length subgraph and put the target node at the end."""
-    context_size = subgraph_size - 1
-    if context_size <= 0:
-        return [seed]
-
-    selected: List[int] = []
-    selected_set: set[int] = set()
+def _rwr_unique_trace(seed: int, neighbors: List[List[int]], restart_prob: float, max_steps: int) -> List[int]:
     cur = seed
-
+    trace = [seed]
     for _ in range(max_steps):
-        cur_neighbors = neighbors[cur]
-        if (not cur_neighbors) or random.random() < restart_prob:
+        if random.random() < restart_prob or not neighbors[cur]:
             cur = seed
         else:
-            cur = random.choice(cur_neighbors)
+            cur = random.choice(neighbors[cur])
+        trace.append(cur)
+    # preserve order while removing duplicates
+    seen = set()
+    unique = []
+    for node in trace:
+        if node not in seen:
+            seen.add(node)
+            unique.append(node)
+    return unique
 
-        if cur != seed and cur not in selected_set:
-            selected.append(cur)
-            selected_set.add(cur)
-            if len(selected) >= context_size:
+
+def generate_rwr_subgraph(edge_index_or_neighbors, subgraph_size: int, num_nodes: int = None):
+    """Generate RWR subgraphs using PyG edge_index instead of DGL.
+
+    The returned subgraph keeps the original CGAD convention:
+    the target node is placed at the final position of each subgraph.
+    """
+    if isinstance(edge_index_or_neighbors, torch.Tensor):
+        if num_nodes is None:
+            num_nodes = int(edge_index_or_neighbors.max().item()) + 1
+        neighbors = build_neighbor_lists(edge_index_or_neighbors, num_nodes)
+    else:
+        neighbors = edge_index_or_neighbors
+        num_nodes = len(neighbors)
+
+    reduced_size = subgraph_size - 1
+    subgraphs = []
+    for node in range(num_nodes):
+        unique_nodes = _rwr_unique_trace(
+            node,
+            neighbors,
+            restart_prob=1.0,
+            max_steps=max(subgraph_size * 3, 1),
+        )
+        retry_time = 0
+        while len(unique_nodes) < reduced_size:
+            unique_nodes = _rwr_unique_trace(
+                node,
+                neighbors,
+                restart_prob=0.9,
+                max_steps=max(subgraph_size * 5, 1),
+            )
+            retry_time += 1
+            if len(unique_nodes) <= 2 and retry_time > 10:
                 break
 
-    if len(selected) < context_size:
-        _fallback_expand(seed, neighbors, selected, selected_set, context_size)
-
-    # Keep tensor shapes stable for isolated or tiny components. Repeating the
-    # available context is preferable to failing; if there is no context, repeat
-    # the target, matching the original code's padding behavior.
-    if not selected:
-        selected = [seed]
-    while len(selected) < context_size:
-        selected.append(selected[len(selected) % len(selected)])
-
-    return selected[:context_size] + [seed]
+        candidate = [v for v in unique_nodes if v != node]
+        if not candidate:
+            candidate = [node]
+        while len(candidate) < reduced_size:
+            candidate.extend(candidate)
+        candidate = candidate[:reduced_size]
+        candidate.append(node)
+        subgraphs.append(candidate)
+    return subgraphs
 
 
-def generate_rwr_subgraph(
-    edge_index_or_neighbors: torch.Tensor | Sequence[Sequence[int]],
-    num_nodes_or_subgraph_size: int,
-    subgraph_size: int | None = None,
-    *,
-    restart_prob: float = 0.9,
-    max_steps: int | None = None,
-    undirected: bool = True,
-) -> List[List[int]]:
-    """Generate RWR subgraphs using PyG ``edge_index`` instead of DGL.
+def generate_coef(features: np.ndarray) -> np.ndarray:
+    """Generate feature cosine-similarity matrix used by CGAD sample selection."""
+    if sp.issparse(features):
+        features = features.toarray()
+    return cosine_similarity(np.asarray(features, dtype=np.float32))
 
-    Two calling styles are supported:
 
-    1. ``generate_rwr_subgraph(edge_index, num_nodes, subgraph_size)``
-    2. ``generate_rwr_subgraph(neighbor_lists, subgraph_size)``
+def _largest_remainder_partition(nodecom: List[int], max_communities: int) -> List[int]:
+    """Merge tiny surplus communities into [0, max_communities-1] ids."""
+    if max_communities <= 0:
+        return nodecom
+    uniq = sorted(set(nodecom))
+    if len(uniq) <= max_communities:
+        remap = {cid: i for i, cid in enumerate(uniq)}
+        return [remap[cid] for cid in nodecom]
 
-    Returns
-    -------
-    list[list[int]]
-        One subgraph per target node. Each subgraph has length ``subgraph_size``;
-        the target node is always the final element.
-    """
-    if subgraph_size is None:
-        neighbors = edge_index_or_neighbors  # type: ignore[assignment]
-        subgraph_size = int(num_nodes_or_subgraph_size)
-        num_nodes = len(neighbors)  # type: ignore[arg-type]
+    counts = Counter(nodecom)
+    keep = [cid for cid, _ in counts.most_common(max_communities)]
+    keep_set = set(keep)
+    remap = {cid: i for i, cid in enumerate(keep)}
+    merged = []
+    for idx, cid in enumerate(nodecom):
+        if cid in keep_set:
+            merged.append(remap[cid])
+        else:
+            # Assign remaining communities to the nearest-size bucket deterministically.
+            merged.append(idx % max_communities)
+    return merged
+
+
+def generate_community(edge_index: torch.Tensor, num_nodes: int, method: str = "louvain", seed: int = 1,
+                       max_communities: int = 0) -> List[int]:
+    """Generate community id for every node, replacing the original external json."""
+    graph = nx.Graph()
+    graph.add_nodes_from(range(num_nodes))
+    graph.add_edges_from(edge_index.detach().cpu().long().t().tolist())
+
+    communities = None
+    if method == "louvain" and hasattr(nx.community, "louvain_communities"):
+        communities = nx.community.louvain_communities(graph, seed=seed)
+    elif method == "greedy":
+        communities = nx.community.greedy_modularity_communities(graph)
+    elif method == "components":
+        communities = list(nx.connected_components(graph))
     else:
-        edge_index = edge_index_or_neighbors  # type: ignore[assignment]
-        num_nodes = int(num_nodes_or_subgraph_size)
-        neighbors = build_neighbor_lists(edge_index, num_nodes, undirected=undirected)  # type: ignore[arg-type]
+        # Safe fallback for older networkx versions.
+        try:
+            communities = nx.community.greedy_modularity_communities(graph)
+        except Exception:
+            communities = list(nx.connected_components(graph))
 
-    if subgraph_size < 1:
-        raise ValueError("subgraph_size must be at least 1")
+    nodecom = [0] * num_nodes
+    for cid, nodes in enumerate(communities):
+        for node in nodes:
+            nodecom[int(node)] = int(cid)
 
-    if max_steps is None:
-        max_steps = max(20, subgraph_size * 10)
+    nodecom = _largest_remainder_partition(nodecom, max_communities)
+    uniq = sorted(set(nodecom))
+    remap = {cid: i for i, cid in enumerate(uniq)}
+    return [remap[cid] for cid in nodecom]
 
-    return [
-        _single_rwr_subgraph(
-            seed=node,
-            neighbors=neighbors,  # type: ignore[arg-type]
-            subgraph_size=subgraph_size,
-            restart_prob=restart_prob,
-            max_steps=max_steps,
+
+def load_or_generate_preprocess(data: Data, args):
+    """Load cached community/coef if available, otherwise generate them automatically."""
+    cache_dir = Path(os.path.expanduser(args.cache_dir))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    community_path = cache_dir / f"{args.dataset}.json"
+    coef_path = cache_dir / f"{args.dataset}.pkl"
+
+    if args.force_preprocess or not community_path.exists():
+        nodecom = generate_community(
+            data.edge_index,
+            data.num_nodes,
+            method=args.community_method,
+            seed=args.seed,
+            max_communities=args.max_communities,
         )
-        for node in range(num_nodes)
-    ]
-
-
-def recall_at_k(y_true: Sequence[int], scores: Sequence[float], k: int) -> float:
-    """Compute recall@k for anomaly scores."""
-    y_true_arr = np.asarray(y_true).astype(bool)
-    scores_arr = np.asarray(scores)
-    k = int(max(1, min(k, len(scores_arr))))
-    positives = int(y_true_arr.sum())
-    if positives == 0:
-        return 0.0
-    topk = np.argsort(scores_arr)[-k:]
-    return float(y_true_arr[topk].sum() / positives)
-
-
-def get_scores(actual: Sequence[int], score: Sequence[float], k: int) -> tuple[float, float, float]:
-    """Return ROC-AUC, AUPRC/AP, and recall@k without relying on PyGOD."""
-    actual_arr = np.asarray(actual).astype(int)
-    score_arr = np.asarray(score, dtype=float)
-    if len(np.unique(actual_arr)) < 2:
-        auc = 0.0
+        with open(community_path, "w", encoding="utf8") as f:
+            json.dump({"com": nodecom}, f)
     else:
-        auc = float(roc_auc_score(actual_arr, score_arr))
-    ap = float(average_precision_score(actual_arr, score_arr))
-    rec = recall_at_k(actual_arr, score_arr, k)
+        with open(community_path, encoding="utf8") as f:
+            nodecom = json.load(f)["com"]
+
+    if args.force_preprocess or not coef_path.exists():
+        coef = generate_coef(data.x.detach().cpu().numpy())
+        with open(coef_path, "wb") as f:
+            pickle.dump(coef, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        with open(coef_path, "rb") as f:
+            coef = pickle.load(f)
+
+    return nodecom, coef, community_path, coef_path
+
+
+def get_scores(actual, score, k=None):
+    actual = np.asarray(actual).astype(int)
+    score = np.asarray(score)
+    auc = metrics.roc_auc_score(actual, score)
+    ap = metrics.average_precision_score(actual, score)
+    if k is None:
+        k = int(actual.sum())
+    k = max(int(k), 1)
+    order = np.argsort(-score)[:k]
+    rec = float(actual[order].sum() / max(actual.sum(), 1))
     return auc, ap, rec
 
 
-def get_one_sample(
-    subgraph_size: int,
-    nb_nodes: int,
-    coef: Sequence[Sequence[float]],
-    subgraphs: Sequence[Sequence[int]],
-    strategy: str,
-) -> np.ndarray:
-    """Select one positive neighbor position inside every sampled subgraph."""
-    all_samples: List[int] = []
+def get_one_sample(subgraph_size, nb_nodes, coef, subgraphs, strategy):
+    all_samples = []
     for nd in range(nb_nodes):
-        candidates = list(dict.fromkeys(subgraphs[nd]))
-        candidates = [node for node in candidates if node != nd]
-        if not candidates:
-            candidates = [nd]
+        neighbors = list(set(subgraphs[nd]))
+        if nd in neighbors:
+            neighbors.remove(nd)
+        if not neighbors:
+            neighbors = [nd]
 
         if strategy == "random":
-            chosen = random.choice(candidates)
-        elif strategy == "most-relevant":
-            values = [coef[nd][neb] for neb in candidates]
-            chosen = candidates[int(np.argmax(values))]
+            chosen = random.sample(neighbors, 1)[0]
         elif strategy == "least-relevant":
-            values = [coef[nd][neb] for neb in candidates]
-            chosen = candidates[int(np.argmin(values))]
+            coefs = [coef[nd][neb] for neb in neighbors]
+            chosen = neighbors[int(np.argmin(coefs))]
         else:
-            raise ValueError(f"Unknown strategy: {strategy}")
-
-        all_samples.append(list(subgraphs[nd]).index(chosen))
-    return np.asarray(all_samples, dtype=np.int64)
+            coefs = [coef[nd][neb] for neb in neighbors]
+            chosen = neighbors[int(np.argmax(coefs))]
+        all_samples.append(subgraphs[nd].index(chosen))
+    return np.asarray(all_samples)
 
 
 def RemoveIsolated(data):
-    """Remove isolated nodes and keep node-level tensors aligned."""
     num_nodes = data.num_nodes
-    edge_attr = getattr(data, "edge_attr", None)
-    data.edge_index, data.edge_attr, mask = remove_isolated_nodes(
-        data.edge_index, edge_attr, num_nodes=num_nodes
-    )
-    data.num_nodes = int(mask.sum())
-
-    for key, item in data:
+    edge_index, edge_attr, mask = remove_isolated_nodes(data.edge_index, getattr(data, "edge_attr", None), num_nodes)
+    data.edge_index = edge_index
+    data.edge_attr = edge_attr
+    for key, item in list(data):
         if bool(re.search("edge", key)):
             continue
         if torch.is_tensor(item) and item.size(0) == num_nodes:
             data[key] = item[mask]
+    data.num_nodes = int(mask.sum())
     return data
 
 
-def _sample_from_positions(positions: Sequence[int], forbidden: int | None = None) -> int:
-    valid = [pos for pos in positions if pos != forbidden]
-    if not valid:
-        return forbidden if forbidden is not None else 0
-    return random.choice(valid)
+def get_negs(idx, nodecom, communities, Com_size_ratio, num_negs, neg_sample_method):
+    if len(idx) <= 1:
+        return np.zeros((num_negs, len(idx)), dtype=np.int64)
 
-
-def get_negs(
-    idx: Sequence[int],
-    nodecom: Sequence[int],
-    communities: Sequence[int],
-    com_size: Mapping[int, int],
-    num_negs: int,
-    neg_sample_method: str,
-) -> np.ndarray:
-    """Sample negative nodes as local batch indices.
-
-    ``multi_neg_node`` has shape [num_negs, batch_size], matching the original
-    CGAD model indexing logic.
-    """
-    batch_size = len(idx)
-    if batch_size == 0:
-        return np.empty((num_negs, 0), dtype=np.int64)
-
-    all_positions = list(range(batch_size))
-    if batch_size == 1:
-        return np.zeros((num_negs, 1), dtype=np.int64)
-
-    if neg_sample_method == "random":
-        negs = [
-            [_sample_from_positions(all_positions, forbidden=pos) for pos in all_positions]
-            for _ in range(num_negs)
-        ]
+    if neg_sample_method == "random" or len(communities) <= 1:
+        neg_node = list(range(len(idx)))
+        negs = []
+        for _ in range(num_negs):
+            each_negs = random.choices(neg_node, k=len(idx))
+            for i, value in enumerate(each_negs):
+                if value == i:
+                    each_negs[i] = (value + 1) % len(idx)
+            negs.append(each_negs)
         return np.asarray(negs, dtype=np.int64)
 
-    positions_by_com: Dict[int, List[int]] = defaultdict(list)
-    for local_pos, node in enumerate(idx):
-        positions_by_com[int(nodecom[node])].append(local_pos)
+    mapper = {node: i for i, node in enumerate(idx)}
+    com_to_pos = []
+    for com in communities:
+        nodes = [mapper[nd] for nd in idx if nodecom[nd] == com]
+        com_to_pos.append(nodes)
 
-    negs_per_node: List[List[int]] = []
-    for local_pos, node in enumerate(idx):
-        own_com = int(nodecom[node])
-        available_coms = [
-            com for com in communities
-            if com != own_com and len(positions_by_com.get(int(com), [])) > 0
-        ]
-        if not available_coms:
-            negs_per_node.append([
-                _sample_from_positions(all_positions, forbidden=local_pos)
-                for _ in range(num_negs)
-            ])
+    negs = []
+    for nd in idx:
+        nd_com = nodecom[nd]
+        candidate_coms = [com for com in communities if com != nd_com and len(com_to_pos[com]) > 0]
+        if not candidate_coms:
+            candidates = [i for i in range(len(idx)) if i != mapper[nd]]
+            negs.append(random.choices(candidates, k=num_negs))
             continue
 
         if neg_sample_method == "bias":
-            weights = np.asarray([com_size[int(com)] for com in available_coms], dtype=float)
-            weights = weights / weights.sum()
-        elif neg_sample_method == "even":
-            weights = np.ones(len(available_coms), dtype=float) / len(available_coms)
-        else:
-            raise ValueError(f"Unknown neg_sample_method: {neg_sample_method}")
+            weights = []
+            for com in candidate_coms:
+                original_candidates = [c for c in communities if c != nd_com]
+                pos = original_candidates.index(com)
+                weights.append(Com_size_ratio[nd_com][pos])
+        else:  # even
+            weights = [1.0] * len(candidate_coms)
 
-        sampled = []
-        for _ in range(num_negs):
-            chosen_com = int(random.choices(list(available_coms), weights=weights.tolist(), k=1)[0])
-            sampled.append(random.choice(positions_by_com[chosen_com]))
-        negs_per_node.append(sampled)
-
-    return np.asarray(negs_per_node, dtype=np.int64).T
+        selected_coms = random.choices(candidate_coms, weights=weights, k=num_negs)
+        selected = []
+        for com in selected_coms:
+            selected.append(random.choice(com_to_pos[com]))
+        negs.append(selected)
+    return np.asarray(negs, dtype=np.int64).T
