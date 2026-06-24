@@ -9,6 +9,7 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 from torch_geometric.utils import to_scipy_sparse_matrix
+from tqdm import trange
 
 try:
     from model.model import Model
@@ -224,7 +225,7 @@ def train_ours(args):
     batch_size = int(getattr(args, "batch_size", 256))
     batch_num = max(math.ceil(nb_nodes / batch_size), 1)
 
-    for run in range(int(getattr(args, "runs", 1))):
+    for run in trange(int(getattr(args, "runs", 1)), desc="Run", position=0, leave=True, disable=not args.tqdm):
         seed = seeds[run]
         set_seed(seed)
         model = Model(ft_size, args.embedding_dim, "prelu", args.readout, args.T).to(device)
@@ -235,7 +236,7 @@ def train_ours(args):
         best_t = 0
         epochs_trained = 0
 
-        for epoch in range(int(getattr(args, "num_epoch", 100))):
+        for epoch in trange(int(getattr(args, "num_epoch", 100)), desc="Epoch", position=1, leave=False, disable=not args.tqdm):
             model.train()
             total_loss = 0.0
             total_seen = 0
@@ -288,7 +289,7 @@ def train_ours(args):
         multi_round_ano_score = np.zeros((test_rounds, nb_nodes), dtype=np.float32)
 
         with torch.no_grad():
-            for round_id in range(test_rounds):
+            for round_id in trange(test_rounds, desc="Test", position=1, leave=False, disable=not args.tqdm):
                 bank_id = round_id % len(subgraph_bank_t)
                 subgraph_tensor = subgraph_bank_t[bank_id]
                 all_samples = sample_bank[bank_id]

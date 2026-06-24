@@ -77,6 +77,7 @@ def parse_args():
     parser.add_argument("--q", type=float, default=0.3)
 
     parser.add_argument("--grid_search", action="store_true", help="Run original-style small grid search")
+    parser.add_argument("--tqdm", action="store_true")
     return parser.parse_args()
 
 

@@ -499,6 +499,7 @@ def get_scores(actual, score, k=None):
         raise ValueError(f"actual length {actual.shape[0]} != score length {score.shape[0]}")
     positives = int(actual.sum())
     has_two_classes = len(np.unique(actual)) == 2
+    score = np.nan_to_num(score)
     auc_value = float(roc_auc_score(actual, score)) if has_two_classes else float("nan")
     if positives > 0:
         precision, recall, _ = precision_recall_curve(actual, score)

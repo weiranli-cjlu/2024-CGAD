@@ -243,6 +243,8 @@ def build_cgad_args(cli: argparse.Namespace, trial: optuna.trial.Trial) -> Simpl
     args.T = trial.suggest_float("T", cli.min_T, cli.max_T)
     args.q = trial.suggest_float("q", cli.min_q, cli.max_q)
 
+    args.tqdm = False
+
     return args
 
 
