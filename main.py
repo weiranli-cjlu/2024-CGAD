@@ -1,10 +1,12 @@
 import argparse
 import csv
+import math
 import os
 import warnings
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Iterable, List
 
 # Limit OpenMP/MKL oversubscription before importing heavy numeric libraries.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -19,6 +21,53 @@ from run.run import train_ours
 from utils.utils import get_scores
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+CSV_FIELDS = [
+    "datetime",
+    "dataset",
+    "runs",
+    "auc",
+    "auprc",
+    "num_epoch",
+    "epochs_trained",
+    "best_epoch",
+    "recall_at_k",
+    "auc_mean",
+    "auc_std",
+    "auc_var",
+    "auc_max",
+    "auprc_mean",
+    "auprc_std",
+    "auprc_var",
+    "auprc_max",
+    "recall_mean",
+    "recall_std",
+    "recall_var",
+    "recall_max",
+    "lr",
+    "batch_size",
+    "embedding_dim",
+    "patience",
+    "weight_decay",
+    "subgraph_size",
+    "auc_test_rounds",
+    "neg_sample_method",
+    "num_negs",
+    "strategy",
+    "alpha",
+    "lam",
+    "T",
+    "q",
+    "seed",
+    "seeds",
+    "community_method",
+    "max_communities",
+    "rwr_restart_prob",
+    "subgraph_cache_rounds",
+    "data_dir",
+    "train_dir",
+]
 
 
 def _expand_path(path_like):
@@ -104,17 +153,138 @@ def dataset_default_grid(args):
     return [args.lr], [args.batch_size], [args.embedding_dim]
 
 
+def _finite_array(values: Iterable[float]) -> np.ndarray:
+    arr = np.asarray(list(values), dtype=float)
+    return arr[np.isfinite(arr)]
+
+
+def _stat(values: Iterable[float]) -> Dict[str, float]:
+    arr = _finite_array(values)
+    if arr.size == 0:
+        return {"mean": float("nan"), "std": float("nan"), "var": float("nan"), "max": float("nan")}
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr, ddof=0)),
+        "var": float(np.var(arr, ddof=0)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _fmt_float(value: float, digits: int = 6) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return "nan"
+    return f"{float(value):.{digits}f}"
+
+
+def _fmt_metric(values: Iterable[float]) -> str:
+    """Format metrics as mean±std(max) in percentage, e.g. 90.21±2.33(91.00)."""
+    s = _stat(values)
+    if not all(math.isfinite(s[k]) for k in ("mean", "std", "max")):
+        return "nan±nan(nan)"
+    return f"{s['mean'] * 100:.2f}±{s['std'] * 100:.2f}({s['max'] * 100:.2f})"
+
+
+def _fmt_epoch(values: Iterable[float]) -> str:
+    arr = _finite_array(values)
+    if arr.size == 0:
+        return "nan±nan(nan)"
+    return f"{np.mean(arr):.2f}±{np.std(arr, ddof=0):.2f}({np.max(arr):.0f})"
+
+
 def append_result_csv(path, row):
     if path is None:
         return
     path = _expand_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
+
+    # If an old result CSV exists with a different header, migrate it once so
+    # newly appended rows keep correct column alignment.
+    if path.exists() and path.stat().st_size > 0:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            old_fields = reader.fieldnames or []
+            old_rows = list(reader)
+        if old_fields != CSV_FIELDS:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                for old_row in old_rows:
+                    writer.writerow({field: old_row.get(field, "") for field in CSV_FIELDS})
+
+    write_header = not path.exists() or path.stat().st_size == 0
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         if write_header:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
+
+
+def _evaluate_run_scores(ano_label: np.ndarray, run_scores: List[np.ndarray]):
+    metrics = []
+    k = int(np.sum(ano_label))
+    for run_idx, score in enumerate(run_scores, start=1):
+        auc, auprc, recall = get_scores(ano_label, score, k)
+        metrics.append({"run": run_idx, "auc": auc, "auprc": auprc, "recall_at_k": recall})
+    return metrics
+
+
+def _build_summary_row(args, run_metrics, run_infos):
+    auc_values = [item["auc"] for item in run_metrics]
+    auprc_values = [item["auprc"] for item in run_metrics]
+    recall_values = [item["recall_at_k"] for item in run_metrics]
+    epoch_values = [item.get("epochs_trained", float("nan")) for item in run_infos]
+    best_epoch_values = [item.get("best_epoch", float("nan")) + 1 for item in run_infos]
+    seeds = [str(item.get("seed", "")) for item in run_infos]
+
+    auc_stat = _stat(auc_values)
+    auprc_stat = _stat(auprc_values)
+    recall_stat = _stat(recall_values)
+
+    return {
+        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "dataset": args.dataset,
+        "runs": int(getattr(args, "runs", 1)),
+        "num_epoch": int(getattr(args, "num_epoch", 100)),
+        "epochs_trained": _fmt_epoch(epoch_values),
+        "best_epoch": _fmt_epoch(best_epoch_values),
+        "auc": _fmt_metric(auc_values),
+        "auprc": _fmt_metric(auprc_values),
+        "recall_at_k": _fmt_metric(recall_values),
+        "auc_mean": _fmt_float(auc_stat["mean"]),
+        "auc_std": _fmt_float(auc_stat["std"]),
+        "auc_var": _fmt_float(auc_stat["var"]),
+        "auc_max": _fmt_float(auc_stat["max"]),
+        "auprc_mean": _fmt_float(auprc_stat["mean"]),
+        "auprc_std": _fmt_float(auprc_stat["std"]),
+        "auprc_var": _fmt_float(auprc_stat["var"]),
+        "auprc_max": _fmt_float(auprc_stat["max"]),
+        "recall_mean": _fmt_float(recall_stat["mean"]),
+        "recall_std": _fmt_float(recall_stat["std"]),
+        "recall_var": _fmt_float(recall_stat["var"]),
+        "recall_max": _fmt_float(recall_stat["max"]),
+        "lr": getattr(args, "lr", ""),
+        "batch_size": getattr(args, "batch_size", ""),
+        "embedding_dim": getattr(args, "embedding_dim", ""),
+        "patience": getattr(args, "patience", ""),
+        "weight_decay": getattr(args, "weight_decay", ""),
+        "subgraph_size": getattr(args, "subgraph_size", ""),
+        "auc_test_rounds": getattr(args, "auc_test_rounds", ""),
+        "neg_sample_method": getattr(args, "neg_sample_method", ""),
+        "num_negs": getattr(args, "num_negs", ""),
+        "strategy": getattr(args, "strategy", ""),
+        "alpha": getattr(args, "alpha", ""),
+        "lam": getattr(args, "lam", ""),
+        "T": getattr(args, "T", ""),
+        "q": getattr(args, "q", ""),
+        "seed": getattr(args, "seed", ""),
+        "seeds": ";".join(seeds),
+        "community_method": getattr(args, "community_method", ""),
+        "max_communities": getattr(args, "max_communities", ""),
+        "rwr_restart_prob": getattr(args, "rwr_restart_prob", ""),
+        "subgraph_cache_rounds": getattr(args, "subgraph_cache_rounds", ""),
+        "data_dir": getattr(args, "data_dir", ""),
+        "train_dir": getattr(args, "train_dir", ""),
+    }
 
 
 def main():
@@ -127,7 +297,7 @@ def main():
     else:
         lrs, batch_sizes, embedding_dims = [args.lr], [args.batch_size], [args.embedding_dim]
 
-    results = []
+    summary_rows = []
     for lr in lrs:
         for batch_size in batch_sizes:
             for embedding_dim in embedding_dims:
@@ -135,37 +305,34 @@ def main():
                 cur_args.lr = lr
                 cur_args.batch_size = batch_size
                 cur_args.embedding_dim = embedding_dim
+                cur_args.return_run_scores = True
 
                 print("\n==============================")
                 print(
-                    f"dataset={cur_args.dataset}, lr={cur_args.lr}, "
+                    f"dataset={cur_args.dataset}, runs={cur_args.runs}, lr={cur_args.lr}, "
                     f"batch_size={cur_args.batch_size}, embedding_dim={cur_args.embedding_dim}, "
                     f"subgraph_cache_rounds={cur_args.subgraph_cache_rounds}"
                 )
-                ano_label, ano_score_final = train_ours(cur_args)
-                k = int(np.sum(ano_label))
-                auc, auprc, recall = get_scores(ano_label, ano_score_final, k)
-                print(f"AUC={auc:.4f}, AUPRC={auprc:.4f}, Recall@K={recall:.4f}")
-                results.append([auc, auprc, recall])
 
-                append_result_csv(
-                    cur_args.results_csv,
-                    {
-                        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "dataset": cur_args.dataset,
-                        "runs": cur_args.runs,
-                        "num_epoch": cur_args.num_epoch,
-                        "batch_size": cur_args.batch_size,
-                        "embedding_dim": cur_args.embedding_dim,
-                        "lr": cur_args.lr,
-                        "auc": f"{auc:.6f}",
-                        "auprc": f"{auprc:.6f}",
-                        "recall_at_k": f"{recall:.6f}",
-                    },
+                ano_label, _, run_scores, run_infos = train_ours(cur_args)
+                run_metrics = _evaluate_run_scores(ano_label, run_scores)
+                row = _build_summary_row(cur_args, run_metrics, run_infos)
+                append_result_csv(cur_args.results_csv, row)
+                summary_rows.append(row)
+
+                print(
+                    f"Summary: AUC={row['auc']}, AUPRC={row['auprc']}, "
+                    f"Recall@K={row['recall_at_k']}, epochs={row['epochs_trained']}"
                 )
+                print(f"Saved result to: {_expand_path(cur_args.results_csv)}")
 
-    final_metric = np.mean(results, axis=0)
-    print("Final mean [AUC, AUPRC, Recall@K]:", final_metric)
+    if summary_rows:
+        print("\nFinal summaries:")
+        for row in summary_rows:
+            print(
+                f"dataset={row['dataset']}, lr={row['lr']}, batch_size={row['batch_size']}, "
+                f"embedding_dim={row['embedding_dim']}, AUC={row['auc']}, AUPRC={row['auprc']}"
+            )
 
 
 if __name__ == "__main__":
