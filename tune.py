@@ -432,7 +432,7 @@ def build_best_training_command(
             tokens += [f"--{key}", best_params[key]]
 
     # main.py keeps this argument for compatibility.
-    tokens += ["--loss_fun", "rnce"]
+    tokens += ["--loss_fun", "rnce", "--tqdm"]
 
     return shell_join(tokens)
 
